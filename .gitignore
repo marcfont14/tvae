@@ -1,0 +1,24 @@
+# Datos
+raw_data/
+plots/
+*.pkl
+*.parquet
+data/
+
+# Entorno virtual
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Outputs del modelo
+checkpoints/
+logs/
+results/
+
+# Windows metadata
+*Zone.Identifier
+
