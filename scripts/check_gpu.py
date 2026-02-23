@@ -1,10 +1,10 @@
 """
 check_gpu.py
 ============
-Verifica que TensorFlow detecta correctamente la GPU en el docker de NVIDIA.
-Ejecutar antes de cualquier entrenamiento.
+Verifies that TensorFlow correctly detects the GPU in the NVIDIA Docker container.
+Run before any training.
 
-Uso:
+Usage:
     python check_gpu.py
 """
 
@@ -14,7 +14,7 @@ import sys
 
 def check_python_packages():
     print("─" * 50)
-    print("  PAQUETES DEL ENTORNO")
+    print("  ENVIRONMENT PACKAGES")
     print("─" * 50)
     packages = ['numpy', 'pandas', 'tensorflow', 'pyarrow', 'matplotlib', 'seaborn']
     for pkg in packages:
@@ -23,7 +23,7 @@ def check_python_packages():
             version = getattr(mod, '__version__', 'unknown')
             print(f"  ✓ {pkg:<20} {version}")
         except ImportError:
-            print(f"  ✗ {pkg:<20} NO INSTALADO")
+            print(f"  ✗ {pkg:<20} NOT INSTALLED")
 
 
 def check_tensorflow_gpu():
@@ -39,42 +39,42 @@ def check_tensorflow_gpu():
 
         gpus = tf.config.list_physical_devices('GPU')
         cpus = tf.config.list_physical_devices('CPU')
-        print(f"  CPUs detectadas   : {len(cpus)}")
-        print(f"  GPUs detectadas   : {len(gpus)}")
+        print(f"  CPUs detected     : {len(cpus)}")
+        print(f"  GPUs detected     : {len(gpus)}")
 
         if not gpus:
-            print("\n  ✗ No se detectó ninguna GPU.")
-            print("    Comprueba que el contenedor se lanzó con --gpus all")
+            print("\n  ✗ No GPU detected.")
+            print("    Check that the container was launched with --gpus all")
             return False
 
         for i, gpu in enumerate(gpus):
             print(f"\n  GPU {i}: {gpu.name}")
             try:
                 details = tf.config.experimental.get_device_details(gpu)
-                print(f"    Nombre         : {details.get('device_name', 'N/A')}")
+                print(f"    Name           : {details.get('device_name', 'N/A')}")
                 print(f"    Compute capability: {details.get('compute_capability', 'N/A')}")
             except Exception:
                 pass
 
-        # Habilitar memory growth para evitar que TF reserve toda la VRAM
+        # Enable memory growth to avoid TensorFlow reserving all VRAM
         for gpu in gpus:
             try:
                 tf.config.experimental.set_memory_growth(gpu, True)
-                print(f"\n  ✓ Memory growth activado en {gpu.name}")
+                print(f"\n  ✓ Memory growth enabled on {gpu.name}")
             except RuntimeError as e:
                 print(f"  ⚠ Memory growth: {e}")
 
         return True
 
     except ImportError:
-        print("  ✗ TensorFlow no está instalado")
+        print("  ✗ TensorFlow is not installed")
         return False
 
 
 def check_gpu_compute(n_iterations: int = 100):
-    """Hace una operación real en GPU y mide el tiempo."""
+    """Runs a real GPU operation and measures runtime."""
     print("\n" + "─" * 50)
-    print("  TEST DE CÓMPUTO EN GPU")
+    print("  GPU COMPUTE TEST")
     print("─" * 50)
 
     try:
@@ -83,12 +83,12 @@ def check_gpu_compute(n_iterations: int = 100):
 
         gpus = tf.config.list_physical_devices('GPU')
         if not gpus:
-            print("  ⚠ Sin GPU, saltando test de cómputo")
+            print("  ⚠ No GPU, skipping compute test")
             return
 
-        # Operación de referencia: multiplicación de matrices grandes
+        # Reference operation: large matrix multiplication
         size = 4096
-        print(f"  Multiplicación de matrices {size}×{size} ({n_iterations} iteraciones)")
+        print(f"  Matrix multiplication {size}×{size} ({n_iterations} iterations)")
 
         # CPU
         with tf.device('/CPU:0'):
@@ -112,17 +112,17 @@ def check_gpu_compute(n_iterations: int = 100):
                 tf.matmul(a, b)
             gpu_time = time.perf_counter() - t0
 
-        print(f"  Tiempo CPU : {cpu_time:.3f}s")
-        print(f"  Tiempo GPU : {gpu_time:.3f}s")
+        print(f"  CPU time   : {cpu_time:.3f}s")
+        print(f"  GPU time   : {gpu_time:.3f}s")
         print(f"  Speedup    : {cpu_time / gpu_time:.1f}x")
 
         if cpu_time / gpu_time > 2:
-            print("  ✓ GPU está acelerando correctamente")
+            print("  ✓ GPU is accelerating correctly")
         else:
-            print("  ⚠ El speedup es bajo, revisa la configuración")
+            print("  ⚠ Speedup is low, check the configuration")
 
     except Exception as e:
-        print(f"  ✗ Error en test de cómputo: {e}")
+        print(f"  ✗ Error in compute test: {e}")
 
 
 def check_nvidia_smi():
@@ -142,17 +142,17 @@ def check_nvidia_smi():
                 parts = [p.strip() for p in line.split(',')]
                 if len(parts) >= 5:
                     print(f"  GPU {i}:")
-                    print(f"    Nombre      : {parts[0]}")
+                    print(f"    Name        : {parts[0]}")
                     print(f"    VRAM total  : {parts[1]} MiB")
-                    print(f"    VRAM libre  : {parts[2]} MiB")
-                    print(f"    Temperatura : {parts[3]} °C")
-                    print(f"    Utilización : {parts[4]} %")
+                    print(f"    VRAM free   : {parts[2]} MiB")
+                    print(f"    Temperature : {parts[3]} °C")
+                    print(f"    Utilization : {parts[4]} %")
         else:
-            print(f"  ✗ nvidia-smi falló: {result.stderr}")
+            print(f"  ✗ nvidia-smi failed: {result.stderr}")
     except FileNotFoundError:
-        print("  ✗ nvidia-smi no encontrado")
+        print("  ✗ nvidia-smi not found")
     except subprocess.TimeoutExpired:
-        print("  ✗ nvidia-smi timeout")
+        print("  ✗ nvidia-smi timed out")
 
 
 def main():
@@ -169,9 +169,9 @@ def main():
 
     print("\n" + "=" * 50)
     if gpu_ok:
-        print("  ✓ Entorno listo para entrenar")
+        print("  ✓ Environment ready for training")
     else:
-        print("  ✗ Revisar configuración GPU antes de continuar")
+        print("  ✗ Review GPU configuration before continuing")
     print("=" * 50 + "\n")
 
 
