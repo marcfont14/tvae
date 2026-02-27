@@ -1,8 +1,8 @@
 """
 filter_dataset.py
 =================
-Generates raw_data/metabonet_train_filtered.parquet from the original
-raw_data/metabonet_public_train.parquet file.
+Generates data/raw/metabonet_train_filtered.parquet from the original
+data/raw/metabonet_public_train.parquet file.
 
 Filtering criteria:
     - Patients with >= MIN_BOLUS bolus events (bolus > 0)
@@ -26,8 +26,8 @@ import pyarrow.parquet as pq
 from collections import defaultdict
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-DEFAULT_INPUT  = 'raw_data/metabonet_public_train.parquet'
-DEFAULT_OUTPUT = 'raw_data/metabonet_train_filtered.parquet'
+DEFAULT_INPUT  = 'data/raw/metabonet_public_train.parquet'
+DEFAULT_OUTPUT = 'data/raw/metabonet_train_filtered.parquet'
 MIN_BOLUS      = 10
 MIN_CARBS      = 10
 BATCH_SIZE     = 1_000_000
