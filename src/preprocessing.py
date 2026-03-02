@@ -33,7 +33,6 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 from pathlib import Path
-from scipy.integrate import odeint
 from tqdm import tqdm
 
 from src.settings import Settings
@@ -155,55 +154,72 @@ def add_driver_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-# ── 4. Hovorka model ──────────────────────────────────────────────────────────
+# ── 4. Hovorka model (Euler integration) ─────────────────────────────────────
+# odeint was rejected due to NaN on long series (>50k steps) and large bolus
+# values. Euler with dt=5min is sufficiently accurate and produces no NaN.
 
-def _pi_system(y, t, params, u_values):
-    """3-compartment ODE for plasma insulin."""
-    s1, s2, ifa = y
+def _pi_euler(bolus: np.ndarray, basal: np.ndarray, params) -> np.ndarray:
+    """
+    Plasma Insulin via forward Euler — 3-compartment model.
+    Runs bolus and basal components separately, then sums.
+    """
+    n    = len(bolus)
+    dt   = params.dt
     kdia = 1 / params.tmaxI
-    u_t  = u_values[int(t / params.dt)] if int(t / params.dt) < len(u_values) else 0.0
-    ds1  = u_t - kdia * s1
-    ds2  = kdia * (s1 - s2)
-    difa = (s2 / (params.tmaxI * params.VI)) - params.Ke * ifa
-    return [ds1, ds2, difa]
+
+    # Bolus component
+    s1, s2, ifa = 0.0, 0.0, 0.0
+    ifa_bolus = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        u    = bolus[i] / dt
+        s1  += dt * (u - kdia * s1)
+        s2  += dt * (kdia * (s1 - s2))
+        ifa += dt * ((s2 / (params.tmaxI * params.VI)) - params.Ke * ifa)
+        ifa_bolus[i] = ifa
+
+    # Basal component
+    s1, s2, ifa = 0.0, 0.0, 0.0
+    ifa_basal = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        u    = basal[i] / dt
+        s1  += dt * (u - kdia * s1)
+        s2  += dt * (kdia * (s1 - s2))
+        ifa += dt * ((s2 / (params.tmaxI * params.VI)) - params.Ke * ifa)
+        ifa_basal[i] = ifa
+
+    return params.pi_sign * (ifa_bolus + ifa_basal)
 
 
-def _ra_system(y, t, params, u_values):
-    """2-compartment ODE for rate of carb absorption."""
-    d1, d2 = y
-    u_t = u_values[int(t / params.dt)] if int(t / params.dt) < len(u_values) else 0.0
-    dd1 = params.A_G * u_t - (1 / params.tau_D) * d1
-    dd2 = (1 / params.tau_D) * d1 - (1 / params.tau_D) * d2
-    return [dd1, dd2]
+def _ra_euler(carbs: np.ndarray, params) -> np.ndarray:
+    """
+    Rate of Absorption via forward Euler — 2-compartment model.
+    """
+    n  = len(carbs)
+    dt = params.dt
+    d1, d2 = 0.0, 0.0
+    ra = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        d1 += dt * (params.A_G * carbs[i] - (1 / params.tau_D) * d1)
+        d2 += dt * ((1 / params.tau_D) * d1 - (1 / params.tau_D) * d2)
+        ra[i] = d2 / params.tau_D
+    return ra
 
 
 def compute_hovorka(df: pl.DataFrame, cfg: Settings) -> pl.DataFrame:
     """
-    Compute PI (Plasma Insulin) and RA (Rate of Absorption) via Hovorka ODEs.
+    Compute PI (Plasma Insulin) and RA (Rate of Absorption) via Hovorka model.
+    Uses forward Euler — robust on long series, no NaN.
     Operates on a single-patient DataFrame.
     """
     p_pi = cfg.preprocessing.params_pi
     p_ra = cfg.preprocessing.params_ra
-    n    = len(df)
-    t    = np.arange(0, n * p_pi.dt, p_pi.dt)
 
-    bolus = df['bolus'].to_numpy()
-    basal = df['basal'].to_numpy()
-    carbs = df['carbs'].to_numpy()
+    bolus = df['bolus'].to_numpy().astype(np.float64)
+    basal = df['basal'].to_numpy().astype(np.float64)
+    carbs = df['carbs'].to_numpy().astype(np.float64)
 
-    # PI — bolus component
-    sol_bolus = odeint(_pi_system, [0, 0, 0], t,
-                       args=(p_pi, bolus / p_pi.dt), hmax=p_pi.dt)
-    # PI — basal component
-    sol_basal = odeint(_pi_system, [0, 0, 0], t,
-                       args=(p_pi, basal / p_pi.dt), hmax=p_pi.dt)
-    # PI = bolus_Ifa + basal_Ifa (sign convention from params)
-    pi = p_pi.pi_sign * (sol_bolus[:, 2] + sol_basal[:, 2])
-
-    # RA
-    sol_ra = odeint(_ra_system, [0, 0], t,
-                    args=(p_ra, carbs), hmax=p_ra.dt)
-    ra = sol_ra[:, 1] / p_ra.tau_D
+    pi = _pi_euler(bolus, basal, p_pi)
+    ra = _ra_euler(carbs, p_ra)
 
     return df.with_columns([
         pl.Series('PI', pi.astype(np.float32)),
