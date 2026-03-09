@@ -22,3 +22,6 @@ results/
 # Windows metadata
 *Zone.Identifier
 
+# runs queue
+runs_queue.sh
+runs_log.txt
