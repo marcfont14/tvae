@@ -62,7 +62,7 @@ MASK_TOKEN   = 0.0     # valor que reemplaza CGM en los timesteps enmascarados
 # Transformer
 D_MODEL  = 128
 N_HEADS  = 4
-N_LAYERS = 3
+N_LAYERS = 5
 D_FF     = 256
 DROPOUT  = 0.1
 
@@ -231,26 +231,31 @@ def apply_mask_batch(windows: np.ndarray, mask_ratio: float,
 
 # ── Custom Loss ───────────────────────────────────────────────────────────────
 
+DRIVER_LOSS_WEIGHT  = 3.0   # peso extra en timesteps con influencia de driver
+DRIVER_EFFECT_STEPS = 24    # 2h de efecto fisiológico después de un evento (24×5min)
+
 class MaskedMSELoss(keras.losses.Loss):
     """
-    MSE calculado solo sobre los timesteps enmascarados.
+    MSE ponderado calculado solo sobre los timesteps enmascarados.
 
-    Si calculáramos loss sobre todos los timesteps, el modelo aprendería
-    trivialmente a copiar el input en los timesteps visibles (loss=0 gratis)
-    y dedicaría poca capacidad a los enmascarados. Restringir el loss a los
-    timesteps enmascarados fuerza al encoder a aprender representaciones
-    útiles para la reconstrucción de información faltante.
+    Los timesteps dentro del span enmascarado que siguen a un evento de
+    bolus o carbs reciben peso DRIVER_LOSS_WEIGHT (default 3.0).
+    El resto de timesteps enmascarados reciben peso 1.0.
+
+    Esto fuerza al modelo a aprender la respuesta fisiológica a los drivers
+    en lugar de simplemente interpolar entre los bordes del span enmascarado.
     """
     def call(self, y_true, y_pred, sample_weight=None):
-        # y_true: (batch, 288, 2) — [cgm_real, mask] concatenados
+        # y_true: (batch, 288, 3) — [cgm_real, mask, driver_weight]
         # y_pred: (batch, 288)
-        cgm_real = y_true[:, :, 0]
-        mask     = y_true[:, :, 1]
+        cgm_real      = y_true[:, :, 0]
+        mask          = y_true[:, :, 1]
+        driver_weight = y_true[:, :, 2]
 
-        sq_err   = tf.square(cgm_real - y_pred)    # (batch, 288)
-        masked   = sq_err * mask                   # solo timesteps enmascarados
+        sq_err   = tf.square(cgm_real - y_pred)          # (batch, 288)
+        weighted = sq_err * mask * driver_weight          # peso extra en zonas de driver
         n_masked = tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-8
-        loss     = tf.reduce_sum(masked, axis=1) / tf.squeeze(n_masked, axis=1)
+        loss     = tf.reduce_sum(weighted, axis=1) / tf.squeeze(n_masked, axis=1)
         return tf.reduce_mean(loss)
 
 
@@ -264,6 +269,7 @@ class MaskedMAE(keras.metrics.Metric):
     def update_state(self, y_true, y_pred, sample_weight=None):
         cgm_real = y_true[:, :, 0]
         mask     = y_true[:, :, 1]
+        # MAE sin ponderar — métrica interpretable independiente del driver_weight
         abs_err  = tf.abs(cgm_real - y_pred) * mask
         self.total.assign_add(tf.reduce_sum(abs_err))
         self.count.assign_add(tf.reduce_sum(mask))
@@ -282,9 +288,9 @@ def prepare_data(windows: np.ndarray, mask_ratio: float):
     """
     Genera los pares (X_masked, Y) para el MTSM.
 
-    Y tiene shape (N, 288, 2): concatenación de [cgm_real, mask]
+    Y tiene shape (N, 288, 3): concatenación de [cgm_real, mask, driver_weight]
     porque Keras necesita un solo tensor de targets — empaquetamos
-    el mask junto con el target para poder usarlo dentro del loss.
+    el mask, el target y los pesos de driver juntos para el loss.
     """
     print(f"  Aplicando masking  (ratio={mask_ratio}, "
           f"spans={MASK_MIN_LEN}-{MASK_MAX_LEN} steps = "
@@ -294,8 +300,31 @@ def prepare_data(windows: np.ndarray, mask_ratio: float):
         windows, mask_ratio, MASK_MIN_LEN, MASK_MAX_LEN, MASK_TOKEN
     )
 
-    # Empaquetar target: (N, 288, 2) = [cgm_real, mask]
-    Y = np.stack([cgm_real, masks], axis=-1).astype(np.float32)
+    # Driver weight: timesteps dentro de la máscara que siguen a un evento
+    # de bolus o carbs reciben peso DRIVER_LOSS_WEIGHT, el resto peso 1.0.
+    # Fuerza al modelo a aprender la respuesta fisiológica a los drivers
+    # en lugar de simplemente interpolar entre los bordes del span.
+    bolus = windows[:, :, 5]   # bolus_logged (binary)
+    carbs = windows[:, :, 6]   # carbs_logged (binary)
+
+    # Propagar el efecto del evento hacia adelante DRIVER_EFFECT_STEPS steps
+    # (un bolus/carbs tiene efecto fisiológico durante ~1-2h después del evento)
+    driver_event = ((bolus + carbs) > 0).astype(np.float32)
+    driver_influence = np.zeros_like(driver_event)
+    for offset in range(1, DRIVER_EFFECT_STEPS + 1):
+        driver_influence[:, offset:] += driver_event[:, :-offset]
+    driver_influence = np.clip(driver_influence, 0, 1)
+
+    # weight = DRIVER_LOSS_WEIGHT donde hay influencia de driver Y máscara activa
+    # weight = 1.0 en el resto de timesteps enmascarados
+    driver_weight = np.where(
+        (driver_influence > 0) & (masks > 0),
+        DRIVER_LOSS_WEIGHT,
+        1.0
+    ).astype(np.float32)
+
+    # Empaquetar target: (N, 288, 3) = [cgm_real, mask, driver_weight]
+    Y = np.stack([cgm_real, masks, driver_weight], axis=-1).astype(np.float32)
 
     n   = len(x_masked)
     idx = np.random.permutation(n)
