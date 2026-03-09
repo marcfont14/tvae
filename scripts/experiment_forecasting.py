@@ -33,29 +33,32 @@ from tensorflow.keras import layers
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-WINDOW_LEN       = 288      # steps por ventana tal como salen del preprocessing
-FORECAST_HORIZON = 12       # steps a predecir (1h a 5min/step)
-CONTEXT_LEN      = WINDOW_LEN - FORECAST_HORIZON  # 276 steps de input (23h)
+WINDOW_LEN       = 288
+FORECAST_HORIZON = 12
+CONTEXT_LEN      = 144   # 276→144 (12h): attention matrix 4x más pequeña (seq² escala cuadrático)
+                          # 12h de contexto es suficiente para capturar un ciclo postprandial
+                          # completo + patrones circadianos. El modelo final usará 288 steps
+                          # pero para este experimento de validación 144 es adecuado.
 N_FEATURES       = 10
-CGM_IDX          = 0        # feature 0 = CGM normalizado
+CGM_IDX          = 0
 
-# Features (sin amplificación — igual que en el modelo final):
+# Features (sin modificación — igual que en el modelo final):
 #   0=CGM  1=PI  2=RA  3=hour_sin  4=hour_cos
 #   5=bolus_logged  6=carbs_logged  7=AID  8=SAP  9=MDI
 
 # Transformer
-D_MODEL  = 256   # 128 → 256: representaciones más ricas por timestep
-N_HEADS  = 8     # 4 → 8: más tipos de relación simultáneos (key_dim=32, ok)
-N_LAYERS = 3     # mantener — con 60min no hay tiempo para beneficiarse de más capas
-D_FF     = 512   # siempre 2×D_MODEL
+D_MODEL  = 128   # suficiente para validar el encoder en este experimento
+N_HEADS  = 4
+N_LAYERS = 3
+D_FF     = 256
 DROPOUT  = 0.1
 
 # MLP baseline
 MLP_UNITS = 256
 
 # Training
-BATCH_SIZE = 64    # 256→64: attention matrix es batch×heads×seq×seq=64×8×276×276 ~150MB/capa, cabe en 8GB VRAM
-EPOCHS     = 100
+BATCH_SIZE = 128  # cabe bien con seq=144: 128×4×144×144 ~13MB/capa
+EPOCHS     = 50
 LR         = 1e-3
 VAL_SPLIT  = 0.1
 TEST_SPLIT  = 0.1
@@ -165,8 +168,13 @@ def prepare_data(windows: np.ndarray):
     Sin ninguna modificación de las features — igual que en el modelo final.
     """
 
-    X = windows[:, :CONTEXT_LEN, :]
-    y = windows[:, CONTEXT_LEN:, CGM_IDX]
+    # Con CONTEXT_LEN=144 y FORECAST_HORIZON=12:
+    # Tomamos steps [132:276] como input y [276:288] como target
+    # — el target sigue siendo la última hora de la ventana,
+    # y el input son las 12h inmediatamente anteriores.
+    start = WINDOW_LEN - CONTEXT_LEN - FORECAST_HORIZON  # 288-144-12 = 132
+    X = windows[:, start:start + CONTEXT_LEN, :]          # (N, 144, 10)
+    y = windows[:, start + CONTEXT_LEN:, CGM_IDX]         # (N, 12)
 
     assert y.shape[1] == FORECAST_HORIZON
 
@@ -586,36 +594,64 @@ def main(processed_dir: str, epochs: int, max_patients: int = None, debug: bool 
     global EPOCHS
     EPOCHS = epochs
 
-    histories = {}
-    histories['Transformer'] = train_model(transformer, X_train, y_train, X_val, y_val, 'Transformer')
-    histories['MLP']         = train_model(mlp,         X_train, y_train, X_val, y_val, 'MLP')
+    histories    = {}
+    all_metrics  = []
+    all_preds    = {}
 
-    print(f"\n{'='*52}")
-    print(f"  Evaluacion en test set")
-    print(f"{'='*52}")
-    all_metrics, all_preds = [], {}
-    for name, model in [('Transformer', transformer), ('MLP', mlp)]:
-        m, p = evaluate_model(model, X_test, y_test, name)
-        all_metrics.append(m)
-        all_preds[name] = p
+    for model_name, model in [('Transformer', transformer), ('MLP', mlp)]:
+        ckpt_path = os.path.join(RESULTS_DIR, f'{model_name}_best.keras')
 
-    df_m = pd.DataFrame(all_metrics).set_index('Model')
-    df_m.to_csv(os.path.join(RESULTS_DIR, 'metrics_table.csv'))
-    print(f"\n{df_m.to_string()}")
+        try:
+            if os.path.exists(ckpt_path):
+                # Resume: cargar pesos del mejor checkpoint
+                print(f"\n  Cargando checkpoint: {ckpt_path}")
+                model.compile(
+                    optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+                    loss='mse', metrics=['mae']
+                )
+                model.load_weights(ckpt_path)
+                histories[model_name] = None   # no hay history para plot
+            else:
+                histories[model_name] = train_model(
+                    model, X_train, y_train, X_val, y_val, model_name
+                )
+
+            # Evaluar y guardar métricas inmediatamente
+            m, p = evaluate_model(model, X_test, y_test, model_name)
+            all_metrics.append(m)
+            all_preds[model_name] = p
+
+            # CSV parcial — si el siguiente modelo peta, este ya está guardado
+            pd.DataFrame(all_metrics).set_index('Model').to_csv(
+                os.path.join(RESULTS_DIR, 'metrics_table.csv')
+            )
+            print(f"  ✓ {model_name} completado y guardado")
+
+        except Exception as e:
+            print(f"\n  AVISO: {model_name} falló — {e}")
+            print(f"  Continuando con los modelos completados hasta ahora...")
+            continue
+
+    if not all_metrics:
+        print("  No hay resultados que guardar.")
+        return
 
     print(f"\n{'='*52}")
     print(f"  Generando plots")
     print(f"{'='*52}")
-    plot_training_curves(histories,
-                         os.path.join(RESULTS_DIR, 'training_curves.png'))
+
+    valid_histories = {k: v for k, v in histories.items() if v is not None}
+    if valid_histories:
+        plot_training_curves(valid_histories,
+                             os.path.join(RESULTS_DIR, 'training_curves.png'))
+
     plot_forecast_examples(X_test, y_test, all_preds, n_examples=4,
                            save_path=os.path.join(RESULTS_DIR, 'forecast_examples.png'))
     plot_metrics_table(all_metrics,
                        os.path.join(RESULTS_DIR, 'metrics_table.png'))
 
-    # Elegir la ventana con más variabilidad de CGM para el análisis de H
-    variability  = X_test[:, :, CGM_IDX].max(axis=1) - X_test[:, :, CGM_IDX].min(axis=1)
-    h_idx        = int(np.argmax(variability))
+    variability = X_test[:, :, CGM_IDX].max(axis=1) - X_test[:, :, CGM_IDX].min(axis=1)
+    h_idx       = int(np.argmax(variability))
     plot_H_analysis(transformer, X_test[h_idx:h_idx+1],
                     save_path=os.path.join(RESULTS_DIR, 'transformer_H_analysis.png'))
 
