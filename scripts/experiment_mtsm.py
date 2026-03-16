@@ -62,6 +62,10 @@ import matplotlib.gridspec as gridspec
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    tf.config.experimental.set_memory_growth(gpus[0], True)
 
 # ── Config (defaults — todos sobreescribibles por CLI) ────────────────────────
 
@@ -74,9 +78,9 @@ BOLUS_IDX   = 5        # feature 5 = bolus_logged
 CARBS_IDX   = 6        # feature 6 = carbs_logged
 
 # Masking defaults
-MASK_RATIO   = 0.25
-MASK_MIN_LEN = 36       # 3h minimo
-MASK_MAX_LEN = 72       # 6h maximo (Idea 1: hasta 120 = 10h)
+MASK_RATIO   = 0.35
+MASK_MIN_LEN = 60       
+MASK_MAX_LEN = 96       
 MASK_TOKEN   = 0.0
 
 # Transformer
@@ -84,11 +88,11 @@ D_MODEL  = 128
 N_HEADS  = 4
 N_LAYERS = 5
 D_FF     = 256
-DROPOUT  = 0.1
+DROPOUT  = 0.2
 
 # Training
-BATCH_SIZE = 64
-EPOCHS     = 50
+BATCH_SIZE = 128
+EPOCHS     = 35
 LR         = 1e-3
 VAL_SPLIT  = 0.1
 TEST_SPLIT  = 0.1
@@ -573,8 +577,11 @@ def plot_reconstruction_examples(model, windows_orig: np.ndarray,
     np.random.shuffle(flat_candidates)
     np.random.shuffle(dynamic_candidates)
 
-    selected = list(flat_candidates[:2]) + list(dynamic_candidates[:2])
-    labels   = ['Basal (flat)', 'Basal (flat)', 'Dynamic (peak)', 'Dynamic (peak)']
+    selected = list(flat_candidates[:2]) + list(dynamic_candidates[:6])
+    labels   = ['Basal (flat)', 'Basal (flat)',
+            'Dynamic (peak)', 'Dynamic (peak)',
+            'Dynamic (peak)', 'Dynamic (peak)',
+            'Dynamic (peak)', 'Dynamic (peak)']
 
     x_masked_sel = windows_orig[selected].copy()
     for j, idx in enumerate(selected):
@@ -583,8 +590,8 @@ def plot_reconstruction_examples(model, windows_orig: np.ndarray,
 
     y_pred = model.predict(x_masked_sel, verbose=0)
 
-    fig = plt.figure(figsize=(18, 5 * 4))
-    gs  = gridspec.GridSpec(4, 1, figure=fig, hspace=0.6)
+    fig = plt.figure(figsize=(18, 5 * 8))
+    gs  = gridspec.GridSpec(8, 1, figure=fig, hspace=0.6)
     t   = np.arange(WINDOW_LEN)
 
     for row, (idx, label) in enumerate(zip(selected, labels)):
@@ -677,6 +684,22 @@ def load_windows(processed_dir: str, max_patients: int = None) -> np.ndarray:
         all_windows.append(data['windows'])
 
     windows = np.concatenate(all_windows, axis=0).astype(np.float32)
+
+    # Filtrar ventanas sin drivers o con CGM demasiado ruidoso
+    bolus = windows[:, :, BOLUS_IDX]
+    carbs = windows[:, :, CARBS_IDX]
+    cgm   = windows[:, :, CGM_IDX]
+
+    has_driver = ((bolus + carbs) > 0).any(axis=1)           # al menos un evento
+    cgm_std    = cgm.std(axis=1)
+    cgm_ok     = (cgm_std > 0.3) & (cgm_std < 4.0)           # ni plano ni ruido puro
+
+    mask_keep = has_driver & cgm_ok
+    n_before  = len(windows)
+    windows   = windows[mask_keep]
+    print(f"  Filtradas: {n_before - len(windows):,} ventanas patológicas "
+        f"({(1-len(windows)/n_before)*100:.1f}%)  →  quedan {len(windows):,}")
+    
     print(f"  Pacientes: {len(npz_files)}   "
           f"Ventanas: {windows.shape[0]:,}   Shape: {windows.shape}")
     return windows
@@ -703,6 +726,108 @@ def save_run_config(results_dir: str, args):
         f.write(f"DRIVER_EFFECT_STEPS: {DRIVER_EFFECT_STEPS}\n")
     print(f"  Config guardada: {config_path}")
 
+def plot_driver_metrics(model, windows_orig: np.ndarray,
+                        masks: np.ndarray, save_path: str):
+    """
+    Tres métricas cuantitativas de respuesta a drivers:
+      - MAE postprandial (0-2h tras carbs)
+      - MAE postbolus (0-2h tras bolus)
+      - MAE basal (resto)
+    Más histograma de distribución del error por zona.
+    """
+    cgm   = windows_orig[:, :, CGM_IDX]
+    bolus = windows_orig[:, :, BOLUS_IDX]
+    carbs = windows_orig[:, :, CARBS_IDX]
+
+    # Generar predicciones sobre el test set completo
+    x_masked_all = windows_orig.copy()
+    for i in range(len(windows_orig)):
+        m = masks[i].astype(bool)
+        x_masked_all[i, m, CGM_IDX] = MASK_TOKEN
+
+    y_pred = model.predict(x_masked_all, batch_size=BATCH_SIZE, verbose=0)
+    # shape: (N, 288)
+
+    # Propagar influencia de eventos hacia adelante 2h (24 steps)
+    effect_steps = DRIVER_EFFECT_STEPS  # 24 steps = 2h
+
+    carbs_influence = np.zeros_like(carbs)
+    bolus_influence = np.zeros_like(bolus)
+    for offset in range(1, effect_steps + 1):
+        carbs_influence[:, offset:] += (carbs[:, :-offset] > 0).astype(np.float32)
+        bolus_influence[:, offset:] += (bolus[:, :-offset] > 0).astype(np.float32)
+    carbs_influence = np.clip(carbs_influence, 0, 1)
+    bolus_influence = np.clip(bolus_influence, 0, 1)
+
+    # Error absoluto solo en timesteps enmascarados
+    abs_err = np.abs(cgm - y_pred) * masks  # (N, 288)
+
+    # Clasificar timesteps enmascarados en tres zonas
+    postprandial_mask = (carbs_influence > 0) & (masks > 0)
+    postbolus_mask    = (bolus_influence  > 0) & (masks > 0) & (carbs_influence == 0)
+    basal_mask        = (masks > 0) & (carbs_influence == 0) & (bolus_influence == 0)
+
+    def safe_mae(err, zone):
+        n = zone.sum()
+        return (err * zone).sum() / n if n > 0 else 0.0
+
+    mae_postprandial = safe_mae(abs_err, postprandial_mask)
+    mae_postbolus    = safe_mae(abs_err, postbolus_mask)
+    mae_basal        = safe_mae(abs_err, basal_mask)
+
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Driver Response Metrics — MAE by Zone', 
+                 fontsize=14, fontweight='bold')
+
+    # Panel izquierdo: barras MAE por zona
+    ax = axes[0]
+    zones  = ['Postprandial\n(0-2h tras carbs)',
+              'Post-bolus\n(0-2h tras bolus)',
+              'Basal\n(sin driver)']
+    values = [mae_postprandial, mae_postbolus, mae_basal]
+    colors_bar = [COLORS['carbs'], COLORS['bolus'], '#6B7280']
+    bars = ax.bar(zones, values, color=colors_bar, alpha=0.8, edgecolor='white')
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                f'{val:.3f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    ax.set_ylabel('MAE (z-score)', fontsize=11)
+    ax.set_title('MAE por zona de driver', fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.spines[['top', 'right']].set_visible(False)
+
+    # Panel derecho: histograma de errores por zona
+    ax2 = axes[1]
+    err_pp  = abs_err[postprandial_mask].flatten()
+    err_pb  = abs_err[postbolus_mask].flatten()
+    err_bas = abs_err[basal_mask].flatten()
+
+    bins = np.linspace(0, np.percentile(abs_err[masks > 0], 95), 40)
+    ax2.hist(err_bas, bins=bins, alpha=0.5, color='#6B7280',
+             label=f'Basal (n={basal_mask.sum():,})', density=True)
+    ax2.hist(err_pp,  bins=bins, alpha=0.6, color=COLORS['carbs'],
+             label=f'Postprandial (n={postprandial_mask.sum():,})', density=True)
+    ax2.hist(err_pb,  bins=bins, alpha=0.6, color=COLORS['bolus'],
+             label=f'Post-bolus (n={postbolus_mask.sum():,})', density=True)
+    ax2.set_xlabel('MAE (z-score)', fontsize=11)
+    ax2.set_ylabel('Densidad', fontsize=11)
+    ax2.set_title('Distribución del error por zona', fontsize=12)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # Imprimir resumen en consola
+    print(f"  MAE postprandial: {mae_postprandial:.4f} z-score  "
+          f"(n={postprandial_mask.sum():,} timesteps)")
+    print(f"  MAE post-bolus:   {mae_postbolus:.4f} z-score  "
+          f"(n={postbolus_mask.sum():,} timesteps)")
+    print(f"  MAE basal:        {mae_basal:.4f} z-score  "
+          f"(n={basal_mask.sum():,} timesteps)")
+    print(f"  Guardado: {save_path}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -780,6 +905,10 @@ def main(args):
         mask_min_len=MASK_MIN_LEN,
         mask_max_len=args.mask_max_len,
         save_path=os.path.join(results_dir, 'reconstruction_examples.png')
+    )
+    plot_driver_metrics(
+    model, windows_test_orig, masks_test,
+    save_path=os.path.join(results_dir, 'driver_metrics.png')
     )
 
     print(f"\n{'='*52}")
