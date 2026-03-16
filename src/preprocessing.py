@@ -49,11 +49,12 @@ def get_valid_ids(parquet_path: Path, cfg: Settings) -> set[str]:
     stats = {}  # pid -> {'cgm_count': int, 'cgm_null': int, 'cgm_std': float, 'has_carbs': bool}
 
     pf = pq.ParquetFile(parquet_path)
-    for batch in pf.iter_batches(batch_size=500_000, columns=['id', 'CGM', 'carbs']):
+    for batch in pf.iter_batches(batch_size=500_000, columns=['id', 'CGM', 'carbs', 'age']):
         df = batch.to_pandas()
         for pid, grp in df.groupby('id'):
             cgm = grp['CGM']
             carbs = grp['carbs']
+            age = grp['age'].dropna()
             if pid not in stats:
                 stats[pid] = {
                     'cgm_count': 0,
@@ -61,6 +62,7 @@ def get_valid_ids(parquet_path: Path, cfg: Settings) -> set[str]:
                     'cgm_sum':   0.0,
                     'cgm_sum2':  0.0,
                     'has_carbs': False,
+                    'age': np.nan,
                 }
             s = stats[pid]
             valid = cgm.dropna()
@@ -69,6 +71,10 @@ def get_valid_ids(parquet_path: Path, cfg: Settings) -> set[str]:
             s['cgm_sum']   += valid.sum()
             s['cgm_sum2']  += (valid ** 2).sum()
             s['has_carbs'] = s['has_carbs'] or (carbs > 0).any()
+            if np.isnan(s['age']):
+                age_series = grp['age'].dropna()
+                if len(age_series) > 0:
+                    s['age'] = float(age_series.iloc[0])
 
     valid_ids = set()
     for pid, s in stats.items():
@@ -78,9 +84,18 @@ def get_valid_ids(parquet_path: Path, cfg: Settings) -> set[str]:
         missing_pct = 100 * s['cgm_null'] / s['cgm_count']
         mean = s['cgm_sum'] / n
         std  = np.sqrt(s['cgm_sum2'] / n - mean ** 2)
+        min_age = getattr(p, 'min_age', None)
+        max_age = getattr(p, 'max_age', None)
+        age_val = s.get('age', np.nan)
+        age_ok  = True
+        if min_age is not None:
+            age_ok = age_ok and (not np.isnan(age_val)) and (age_val >= min_age)
+        if max_age is not None:
+            age_ok = age_ok and (not np.isnan(age_val)) and (age_val <= max_age)
+
         if (std >= p.cgm_std_min and
                 missing_pct <= p.cgm_missing_max and
-                s['has_carbs']):
+                s['has_carbs'] and age_ok):
             valid_ids.add(str(pid))
 
     print(f"Quality filter: {len(valid_ids)}/{len(stats)} patients passed")
@@ -272,7 +287,7 @@ def normalise_patient(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.nd
 # ── 8. Sliding windows ────────────────────────────────────────────────────────
 
 FEATURE_COLS = ['CGM', 'PI', 'RA', 'hour_sin', 'hour_cos',
-                'bolus_logged', 'carbs_logged', 'AID', 'SAP', 'MDI']
+                'bolus_logged', 'carbs_logged', 'AID', 'SAP', 'MDI', 'age_norm']
 
 
 def extract_windows(df: pl.DataFrame, cfg: Settings) -> np.ndarray:
@@ -311,6 +326,7 @@ def save_patient(
     scaler_mean: np.ndarray,
     scaler_std: np.ndarray,
     modality: str,
+    age: float,
     output_dir: Path,
 ) -> None:
     """Save processed patient data as .npz"""
@@ -322,6 +338,7 @@ def save_patient(
         scaler_std=scaler_std,
         patient_id=np.array([patient_id]),
         modality=np.array([modality]),
+        age=np.array([age], dtype=np.float32),
     )
 
 
@@ -351,7 +368,7 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
     # Buffer to accumulate rows per patient across batches
     patient_buffer: dict[str, list] = {}
 
-    def process_patient(pid: str, rows: list) -> dict:
+    def process_patient(pid: str, rows: list, age: float = np.nan) -> dict:
         """Run full pipeline for one patient. Returns stats."""
         df_pd = pl.from_pandas(
             __import__('pandas').concat(rows).reset_index(drop=True)
@@ -370,6 +387,10 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
         # 5 & 6. Temporal + modality
         df_pd = add_temporal_features(df_pd)
         df_pd = add_modality_onehot(df_pd)
+        age_norm = float(age) / 100.0 if not np.isnan(age) else 0.0
+        df_pd = df_pd.with_columns(
+          pl.lit(age_norm).cast(pl.Float32).alias('age_norm')
+        )
 
         # 7. Normalise
         df_pd, means, stds = normalise_patient(df_pd)
@@ -384,13 +405,13 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
 
         # 9. Save
         if len(windows) > 0:
-            save_patient(pid, windows, means, stds, str(modality), output_dir)
+            save_patient(pid, windows, means, stds, str(modality), age, output_dir)
 
         return {'pid': pid, 'n_windows': len(windows)}
 
     stats_list = []
     cols_needed = ['id', 'date', 'CGM', 'bolus', 'basal', 'carbs',
-                   'insulin_delivery_modality']
+                   'insulin_delivery_modality', 'age']
 
     for batch in tqdm(pf.iter_batches(batch_size=500_000, columns=cols_needed),
                       desc='Streaming batches'):
@@ -406,7 +427,12 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
     print(f"\n[3/4] Running pipeline for {len(patient_buffer)} patients...")
     for pid, rows in tqdm(patient_buffer.items(), desc='Processing patients'):
         try:
-            s = process_patient(pid, rows)
+            import pandas as pd
+            df_all = pd.concat(rows)
+            age = float(df_all['age'].dropna().iloc[0]) \
+                if 'age' in df_all.columns and df_all['age'].notna().any() \
+                else np.nan
+            s = process_patient(pid, rows, age)
             stats_list.append(s)
         except Exception as e:
             print(f"  WARNING: Failed {pid} — {e}")
@@ -421,4 +447,18 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
 
 
 if __name__ == '__main__':
-    run_preprocessing()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output-dir', type=str, default=None)
+    parser.add_argument('--min-age',    type=float, default=None)
+    parser.add_argument('--max-age',    type=float, default=None)
+    args = parser.parse_args()
+
+    cfg = Settings()
+    if args.output_dir:
+        cfg.paths.data_processed = Path(args.output_dir)
+    if args.min_age is not None:
+        cfg.preprocessing.min_age = args.min_age
+    if args.max_age is not None:
+        cfg.preprocessing.max_age = args.max_age
+    run_preprocessing(cfg)

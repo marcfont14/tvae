@@ -70,7 +70,7 @@ if gpus:
 # ── Config (defaults — todos sobreescribibles por CLI) ────────────────────────
 
 WINDOW_LEN  = 288      # steps por ventana (24h a 5min/step)
-N_FEATURES  = 10
+N_FEATURES  = 11
 CGM_IDX     = 0        # feature 0 = CGM
 PI_IDX      = 1        # feature 1 = Plasma Insulin
 RA_IDX      = 2        # feature 2 = Rate of Appearance

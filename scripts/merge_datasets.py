@@ -2,39 +2,51 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
 
-print("Loading T1DEXI...")
-t1dexi = pd.read_parquet("data/raw/t1dexi_parsed.parquet")
-t1dexi['id'] = t1dexi['id'].astype(str)
-t1dexi['age'] = t1dexi['age'].astype(float)
-t1dexi['source_file'] = 'T1DEXI'
-print(f"  T1DEXI: {t1dexi['id'].nunique()} patients, {len(t1dexi)} rows")
-
-print("Merging with METABONET in batches...")
-pf = pq.ParquetFile("data/raw/metabonet_train_filtered.parquet")
-
 writer = None
-meta_patients = set()
-meta_rows = 0
+total_patients = 0
+total_rows = 0
 
-for batch in pf.iter_batches(batch_size=500_000):
-    df_batch = batch.to_pandas()
-    df_batch['id'] = df_batch['id'].astype(str)
-    df_batch['source_file'] = 'METABONET'
-    meta_patients.update(df_batch['id'].unique())
-    meta_rows += len(df_batch)
+def write_source(path, source_name):
+    global writer, total_patients, total_rows
+    print(f"Loading {source_name}...")
+    
+    if path.endswith('.parquet'):
+        pf = pq.ParquetFile(path)
+        patients = set()
+        rows = 0
+        for batch in pf.iter_batches(batch_size=500_000):
+            df = batch.to_pandas()
+            df['id'] = df['id'].astype(str)
+            df['age'] = df['age'].astype(float)  # forzar double en todos
+            df['source_file'] = source_name
+            patients.update(df['id'].unique())
+            rows += len(df)
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    "data/interim/combined_filtered.parquet", table.schema)
+            writer.write_table(table)
+        print(f"  {source_name}: {len(patients)} patients, {rows:,} rows")
+        return len(patients), rows
 
-    table = pa.Table.from_pandas(df_batch, preserve_index=False)
-    if writer is None:
-        writer = pq.ParquetWriter("data/interim/combined_filtered.parquet", table.schema)
-    writer.write_table(table)
+# 1. METABONET
+meta_p, meta_r = write_source(
+    "data/raw/metabonet_train_filtered.parquet", "METABONET")
 
-# Write T1DEXI at the end
-t1dexi_table = pa.Table.from_pandas(t1dexi, preserve_index=False)
-writer.write_table(t1dexi_table)
+# 2. T1DEXI adultos
+t1a_p, t1a_r = write_source(
+    "data/raw/t1dexi_parsed.parquet", "T1DEXI_adults")
+
+# 3. T1DEXI pediátricos
+t1p_p, t1p_r = write_source(
+    "data/raw/t1dexi_p_parsed.parquet", "T1DEXI_pediatric")
+
 writer.close()
 
 print(f"\nCombined dataset:")
-print(f"  METABONET: {len(meta_patients)} patients, {meta_rows} rows")
-print(f"  T1DEXI:    {t1dexi['id'].nunique()} patients, {len(t1dexi)} rows")
-print(f"  Total:     {len(meta_patients) + t1dexi['id'].nunique()} patients, {meta_rows + len(t1dexi)} rows")
+print(f"  METABONET:         {meta_p} patients, {meta_r:,} rows")
+print(f"  T1DEXI adults:     {t1a_p} patients, {t1a_r:,} rows")
+print(f"  T1DEXI pediatric:  {t1p_p} patients, {t1p_r:,} rows")
+print(f"  TOTAL:             {meta_p+t1a_p+t1p_p} patients, "
+      f"{meta_r+t1a_r+t1p_r:,} rows")
 print("Saved to data/interim/combined_filtered.parquet")
