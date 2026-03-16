@@ -23,7 +23,7 @@ Nuevas ideas implementadas (activables via CLI):
                                      un 20% de las iteraciones (default 0.0)
 
 Arquitectura:
-  Input (288, 10) → [masking de CGM] → Transformer Encoder → H (288, d_model)
+  Input (288, 11) → [masking de CGM] → Transformer Encoder → H (288, d_model)
   → Reconstruction Head: Dense(1) por timestep → ŷ sobre spans enmascarados
   → Loss vs target real en esos timesteps
 
@@ -37,21 +37,27 @@ Outputs (en results/mtsm/{run_id}/):
   run_config.txt               configuración exacta del run para reproducibilidad
 
 Usage:
-  # Run original
-  python scripts/experiment_mtsm.py --max_patients 100 --epochs 50
+  python scripts/experiment_mtsm.py [opciones]
 
-  # Run 4: enmascaramiento agresivo
-  python scripts/experiment_mtsm.py --max_patients 100 --epochs 50 \\
-      --mask_ratio 0.45 --mask_max_len 120 --run_id run4
+  Argumentos principales:
+    --data            Directorio con los .npz procesados
+                      (default: data/processed — apunta a data/processed/all
+                      o data/processed/adults según el experimento)
+    --max_patients    Número máximo de pacientes a cargar (default: todos)
+    --epochs          Número máximo de épocas (default: 35, early stopping activo)
+    --run_id          Nombre del run para la carpeta de resultados
+                      (default: timestamp YYYYMMDD_HHMM)
 
-  # Run 5: agresivo + shape loss
-  python scripts/experiment_mtsm.py --max_patients 100 --epochs 50 \\
-      --mask_ratio 0.45 --mask_max_len 120 --shape_loss 0.2 --run_id run5
+  Argumentos opcionales (desactivados por defecto):
+    --mask_ratio      Fracción de timesteps a enmascarar (default: 0.35)
+    --mask_max_len    Span máximo en steps, 1 step = 5min (default: 96 = 8h)
+    --shape_loss      Lambda de penalización de derivada temporal (default: 0.0)
+    --multimodal_prob Probabilidad de enmascarar PI o RA en lugar de CGM
+                      (default: 0.0)
 
-  # Run 6: agresivo + shape loss + multimodal masking
-  python scripts/experiment_mtsm.py --max_patients 100 --epochs 50 \\
-      --mask_ratio 0.45 --mask_max_len 120 --shape_loss 0.2 \\
-      --multimodal_prob 0.2 --run_id run6
+  Ejemplo:
+    python scripts/experiment_mtsm.py \\
+        --data data/processed/all --max_patients 150 --run_id run9
 """
 
 import argparse

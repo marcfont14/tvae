@@ -7,11 +7,12 @@ Input:  data/interim/combined_filtered.parquet
 Output: data/processed/<patient_id>.npz
 
 Each .npz contains:
-    - windows:      (N_windows, 288, 10) float32
+    - windows:      (N_windows, 288, 11) float32
     - scaler_mean:  (3,) float32  — mean  for [CGM, PI, RA]
     - scaler_std:   (3,) float32  — std   for [CGM, PI, RA]
     - patient_id:   str
     - modality:     str
+    - age:          float32
 
 Feature order in window tensor (axis=2):
     0  CGM           normalised
@@ -24,9 +25,19 @@ Feature order in window tensor (axis=2):
     7  AID           one-hot
     8  SAP           one-hot
     9  MDI           one-hot
+    10 age_norm      age / 100 (assumes max age 100 years)
 
 Usage:
-    python -m src.preprocessing
+    # Whole dataset (adults + pediatrics)
+    python -m src.preprocessing --output-dir data/processed/all
+
+    # Only adults (age >= 18)
+    python -m src.preprocessing --output-dir data/processed/adults --min-age 18
+
+  Optional arguments:
+    --output-dir    Output directory (default: data/processed)
+    --min-age       Minimum age to filter patients (default: no limit)
+    --max-age       Maximum age to filter patients (default: no limit)
 """
 
 import numpy as np
@@ -296,14 +307,14 @@ def extract_windows(df: pl.DataFrame, cfg: Settings) -> np.ndarray:
     Shape: (N_valid_windows, window_size, n_features)
     """
     p   = cfg.preprocessing
-    arr = df.select(FEATURE_COLS).to_numpy().astype(np.float32)  # (T, 10)
+    arr = df.select(FEATURE_COLS).to_numpy().astype(np.float32)  # (T, 11)
     T   = len(arr)
     ws  = p.window_size
     st  = p.stride
 
     windows = []
     for start in range(0, T - ws + 1, st):
-        window = arr[start:start + ws]  # (288, 10)
+        window = arr[start:start + ws]  # (288, 11)
         # Check missing CGM (index 0) — discard if > threshold
         cgm_null_frac = np.isnan(window[:, 0]).mean()
         if cgm_null_frac > p.max_missing_window:
@@ -315,7 +326,7 @@ def extract_windows(df: pl.DataFrame, cfg: Settings) -> np.ndarray:
     if len(windows) == 0:
         return np.empty((0, ws, len(FEATURE_COLS)), dtype=np.float32)
 
-    return np.stack(windows, axis=0)  # (N, 288, 10)
+    return np.stack(windows, axis=0)  # (N, 288, 11)
 
 
 # ── 9. Serialisation ──────────────────────────────────────────────────────────

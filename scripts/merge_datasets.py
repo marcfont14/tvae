@@ -17,7 +17,7 @@ def write_source(path, source_name):
         for batch in pf.iter_batches(batch_size=500_000):
             df = batch.to_pandas()
             df['id'] = df['id'].astype(str)
-            df['age'] = df['age'].astype(float)  # forzar double en todos
+            df['age'] = df['age'].astype(float)  
             df['source_file'] = source_name
             patients.update(df['id'].unique())
             rows += len(df)
