@@ -25,3 +25,6 @@ results/
 # runs queue
 runs_queue.sh
 runs_log.txt
+
+# claude 
+CLAUDE.md
