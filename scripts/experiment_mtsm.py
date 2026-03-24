@@ -54,6 +54,8 @@ Usage:
     --shape_loss      Lambda de penalización de derivada temporal (default: 0.0)
     --multimodal_prob Probabilidad de enmascarar PI o RA en lugar de CGM
                       (default: 0.0)
+    --no_age          Elimina age_norm (feature 10) del input al encoder.
+                      Late fusion: age se pasa solo a los heads downstream.
 
   Ejemplo:
     python scripts/experiment_mtsm.py \\
@@ -173,8 +175,9 @@ def build_mtsm_model(window_len, n_features, d_model, n_heads, n_layers,
         window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout
     )
     H   = encoder(inp)
-    out = layers.Dense(1, name='reconstruction_head')(H)       # (batch, 288, 1)
-    out = layers.Reshape((window_len,), name='output')(out)    # (batch, 288)
+    out = layers.Dense(64, activation='relu', name='recon_hidden')(H)  # (batch, 288, 64)
+    out = layers.Dense(1, name='reconstruction_head')(out)             # (batch, 288, 1)
+    out = layers.Reshape((window_len,), name='output')(out)            # (batch, 288)
     return keras.Model(inp, out, name='MTSM'), encoder
 
 
@@ -195,47 +198,6 @@ def create_mask(window_len: int, mask_ratio: float,
         attempts += 1
     return mask
 
-
-def apply_mask_batch(windows: np.ndarray, mask_ratio: float,
-                     min_len: int, max_len: int,
-                     mask_token: float = 0.0,
-                     multimodal_prob: float = 0.0):
-    """
-    Aplica masking a un batch de ventanas.
-
-    Idea 2 — Multimodal masking (multimodal_prob > 0):
-      Con probabilidad multimodal_prob, enmascara PI (feature 1) o RA (feature 2)
-      en lugar de CGM (feature 0). El encoder debe entonces inferir el driver
-      a partir de la curva de glucosa visible — fuerza el aprendizaje de la
-      relacion causal bidireccional entre glucosa y drivers fisiologicos.
-
-    Returns:
-        x_masked:         (N, 288, 10)
-        masks:            (N, 288)
-        targets:          (N, 288)     — valores reales del canal enmascarado
-        masked_channels:  (N,)         — 0=CGM, 1=PI, 2=RA
-    """
-    N = len(windows)
-    x_masked        = windows.copy()
-    masks           = np.zeros((N, WINDOW_LEN), dtype=np.float32)
-    targets         = np.zeros((N, WINDOW_LEN), dtype=np.float32)
-    masked_channels = np.zeros(N, dtype=np.int32)
-
-    for i in range(N):
-        m = create_mask(windows.shape[1], mask_ratio, min_len, max_len)
-
-        # Idea 2: elegir canal a enmascarar
-        if multimodal_prob > 0 and np.random.random() < multimodal_prob:
-            ch = np.random.choice([PI_IDX, RA_IDX])
-        else:
-            ch = CGM_IDX
-
-        x_masked[i, m.astype(bool), ch] = mask_token
-        masks[i]           = m
-        targets[i]         = windows[i, :, ch]
-        masked_channels[i] = ch
-
-    return x_masked, masks, targets, masked_channels
 
 
 # ── Custom Loss ───────────────────────────────────────────────────────────────
@@ -321,106 +283,117 @@ class MaskedMAE(keras.metrics.Metric):
 
 # ── Data preparation ──────────────────────────────────────────────────────────
 
-def compute_driver_weights(windows: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    """Pesos de driver: DRIVER_LOSS_WEIGHT en timesteps enmascarados
-    que caen dentro de DRIVER_EFFECT_STEPS despues de un evento bolus/carbs."""
-    bolus = windows[:, :, BOLUS_IDX]
-    carbs = windows[:, :, CARBS_IDX]
+def apply_masks_vectorized(wins: np.ndarray, mask_ratio: float,
+                           mask_min_len: int, mask_max_len: int,
+                           multimodal_prob: float,
+                           no_logged_events: bool = False,
+                           no_age: bool = False):
+    """
+    Applies masking and driver weighting to N windows at once.
+    Driver weight accumulation is fully vectorized over the batch axis.
+    Returns (x_masked, Y) with Y = stack([target, mask, driver_weight], axis=-1).
 
-    driver_event     = ((bolus + carbs) > 0).astype(np.float32)
-    driver_influence = np.zeros_like(driver_event)
+    no_logged_events: if True, zero out bolus_logged and carbs_logged features
+        so the model must rely on PI and RA alone to detect driver events.
+        Driver loss weighting is still computed from the original windows.
+    no_age: if True, drop feature index 10 (age_norm) from the model input.
+        Driver weighting and masking use original feature indices (unaffected).
+        Late fusion: age should be passed to the downstream head, not the encoder.
+    """
+    N        = len(wins)
+    x_masked = wins.copy()
+    if no_logged_events:
+        x_masked[:, :, BOLUS_IDX] = 0.0
+        x_masked[:, :, CARBS_IDX] = 0.0
+    masks    = np.zeros((N, WINDOW_LEN), dtype=np.float32)
+    targets  = np.zeros((N, WINDOW_LEN), dtype=np.float32)
+
+    for i in range(N):
+        ch = CGM_IDX
+        if multimodal_prob > 0 and np.random.random() < multimodal_prob:
+            ch = int(np.random.choice([PI_IDX, RA_IDX]))
+        m          = create_mask(WINDOW_LEN, mask_ratio, mask_min_len, mask_max_len)
+        targets[i] = wins[i, :, ch]
+        masks[i]   = m
+        x_masked[i, m.astype(bool), ch] = MASK_TOKEN
+
+    # Vectorized driver weights across all N windows
+    bolus        = wins[:, :, BOLUS_IDX]
+    carbs        = wins[:, :, CARBS_IDX]
+    driver_event = ((bolus + carbs) > 0).astype(np.float32)
+    driver_infl  = np.zeros((N, WINDOW_LEN), dtype=np.float32)
     for offset in range(1, DRIVER_EFFECT_STEPS + 1):
-        driver_influence[:, offset:] += driver_event[:, :-offset]
-    driver_influence = np.clip(driver_influence, 0, 1)
-
+        driver_infl[:, offset:] += driver_event[:, :-offset]
+    driver_infl   = np.clip(driver_infl, 0, 1)
     driver_weight = np.where(
-        (driver_influence > 0) & (masks > 0),
-        DRIVER_LOSS_WEIGHT, 1.0
+        (driver_infl > 0) & (masks > 0), DRIVER_LOSS_WEIGHT, 1.0
     ).astype(np.float32)
-    return driver_weight
+
+    # Drop age_norm (feature 10) from model input — late fusion design.
+    # Feature indices 0-9 are unchanged, so BOLUS_IDX/CARBS_IDX stay valid above.
+    if no_age:
+        x_masked = x_masked[:, :, :10]
+
+    Y = np.stack([targets, masks, driver_weight], axis=-1)  # (N, 288, 3)
+    return x_masked.astype(np.float32), Y
 
 
-def prepare_data(windows: np.ndarray, mask_ratio: float,
-                 mask_min_len: int, mask_max_len: int,
-                 multimodal_prob: float):
+def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
+                        mask_min_len: int, mask_max_len: int,
+                        multimodal_prob: float,
+                        no_logged_events: bool = False,
+                        no_age: bool = False) -> tf.data.Dataset:
     """
-    Genera pares (X_masked, Y) para el MTSM.
-    Y: (N, 288, 3) = [target_real, mask, driver_weight]
+    Builds a tf.data.Dataset from an index of (fpath, win_idx) tuples.
+
+    Groups windows by patient file so each .npz is opened ONCE per epoch
+    (not once per window). The generator yields one patient's worth of
+    pre-masked windows at a time; tf.data.unbatch() splits them back into
+    individual samples before batching to BATCH_SIZE.
+
+    Yields (x_masked, Y) where:
+        x_masked: (BATCH_SIZE, 288, 11)
+        Y:        (BATCH_SIZE, 288, 3)  = [target_real, mask, driver_weight]
     """
-    print(f"  Masking  ratio={mask_ratio:.0%}  "
-          f"spans={mask_min_len*5//60}h-{mask_max_len*5//60}h  "
-          f"multimodal_prob={multimodal_prob:.0%}")
+    from collections import defaultdict
+    patient_to_windows: dict = defaultdict(list)
+    for fpath, win_idx in index:
+        patient_to_windows[fpath].append(win_idx)
+    fpaths = list(patient_to_windows.keys())
 
-    x_masked, masks, targets, masked_channels = apply_mask_batch(
-        windows, mask_ratio, mask_min_len, mask_max_len, MASK_TOKEN, multimodal_prob
+    def generator():
+        order = np.random.permutation(len(fpaths)) if shuffle else range(len(fpaths))
+        for pi in order:
+            fpath       = fpaths[pi]
+            win_indices = np.array(patient_to_windows[fpath], dtype=np.int32)
+            data        = np.load(fpath, allow_pickle=True)
+            wins        = data['windows'][win_indices].astype(np.float32)
+            x_masked, Y = apply_masks_vectorized(
+                wins, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
+                no_logged_events=no_logged_events, no_age=no_age
+            )
+            if shuffle:
+                perm     = np.random.permutation(len(wins))
+                x_masked = x_masked[perm]
+                Y        = Y[perm]
+            yield x_masked, Y  # (N_patient_windows, 288, 11/3)
+
+    n_features_out = 10 if no_age else N_FEATURES
+    ds = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(None, WINDOW_LEN, n_features_out), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, WINDOW_LEN, 3),              dtype=tf.float32),
+        )
     )
-
-    driver_weight = compute_driver_weights(windows, masks)
-    Y = np.stack([targets, masks, driver_weight], axis=-1).astype(np.float32)
-
-    n   = len(x_masked)
-    idx = np.random.permutation(n)
-    n_test = int(n * TEST_SPLIT)
-    n_val  = int(n * VAL_SPLIT)
-    test_idx  = idx[:n_test]
-    val_idx   = idx[n_test:n_test + n_val]
-    train_idx = idx[n_test + n_val:]
-
-    masked_per_window = masks.sum(axis=1).mean()
-    n_cgm = (masked_channels == CGM_IDX).sum()
-    n_pi  = (masked_channels == PI_IDX).sum()
-    n_ra  = (masked_channels == RA_IDX).sum()
-    print(f"  Timesteps enmascarados/ventana: "
-          f"{masked_per_window:.1f} ({masked_per_window/WINDOW_LEN*100:.1f}%)")
-    print(f"  Canales — CGM: {n_cgm} ({n_cgm/n*100:.1f}%)  "
-          f"PI: {n_pi} ({n_pi/n*100:.1f}%)  RA: {n_ra} ({n_ra/n*100:.1f}%)")
-    print(f"  Train: {len(train_idx):>7,}  Val: {len(val_idx):>7,}  "
-          f"Test: {len(test_idx):>7,}")
-
-    return (
-        (x_masked[train_idx], Y[train_idx]),
-        (x_masked[val_idx],   Y[val_idx]),
-        (x_masked[test_idx],  Y[test_idx]),
-        windows[test_idx],
-        masks[test_idx],
-    )
+    ds = ds.unbatch()
+    if shuffle:
+        ds = ds.shuffle(buffer_size=5_000, seed=SEED)
+    ds = ds.batch(BATCH_SIZE)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
-
-def train_model(model, X_train, Y_train, X_val, Y_val, epochs, shape_loss_lambda):
-    print(f"\n{'─'*52}")
-    print(f"  Entrenando MTSM")
-    print(f"  Parametros encoder:  "
-          f"{model.get_layer('TransformerEncoder').count_params():,}")
-    print(f"  Parametros totales:  {model.count_params():,}")
-    print(f"  Shape loss lambda:   {shape_loss_lambda}")
-    print(f"{'─'*52}")
-
-    model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
-        loss=MaskedMSELoss(shape_loss_lambda=shape_loss_lambda),
-        metrics=[MaskedMAE()]
-    )
-
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=10, restore_best_weights=True, verbose=1
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1
-        ),
-    ]
-
-    history = model.fit(
-        X_train, Y_train,
-        validation_data=(X_val, Y_val),
-        epochs=epochs,
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks,
-        verbose=1
-    )
-    return history
 
 
 # ── Plot: training curves ─────────────────────────────────────────────────────
@@ -432,9 +405,9 @@ def plot_training_curves(history, save_path: str):
 
     for ax, (metric, label) in zip(axes, [('loss', 'Masked MSE Loss (+ shape)'),
                                            ('masked_mae', 'Masked MAE')]):
-        ax.plot(history.history[metric],
+        ax.plot(history[metric],
                 color='#2563EB', lw=2, ls='-', label='train')
-        ax.plot(history.history[f'val_{metric}'],
+        ax.plot(history[f'val_{metric}'],
                 color='#2563EB', lw=1.5, ls='--', label='val')
         ax.set_xlabel('Epoch', fontsize=11)
         ax.set_ylabel(label, fontsize=11)
@@ -676,40 +649,60 @@ def plot_reconstruction_examples(model, windows_orig: np.ndarray,
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-def load_windows(processed_dir: str, max_patients: int = None) -> np.ndarray:
+def index_dataset(processed_dir: str, max_patients: int = None) -> list:
+    """
+    Builds an index of (filepath, window_idx) tuples without loading data into RAM.
+    Applies quality filters per patient: has_driver and cgm_std in valid range.
+    
+    Returns:
+        List of (filepath, window_idx) tuples — one entry per valid window.
+    """
     npz_files = sorted([f for f in os.listdir(processed_dir) if f.endswith('.npz')])
     if not npz_files:
-        raise FileNotFoundError(f"No .npz encontrados en {processed_dir}")
+        raise FileNotFoundError(f"No .npz files found in {processed_dir}")
     if max_patients is not None:
         npz_files = npz_files[:max_patients]
-        print(f"  (--max_patients {max_patients}: cargando subset)")
+        print(f"  (--max_patients {max_patients}: loading subset)")
 
-    all_windows = []
+    index        = []
+    n_before     = 0
+    n_filtered   = 0
+
     for fname in npz_files:
-        data = np.load(os.path.join(processed_dir, fname), allow_pickle=True)
-        all_windows.append(data['windows'])
+        fpath = os.path.join(processed_dir, fname)
+        data  = np.load(fpath, allow_pickle=True)
+        wins  = data['windows'].astype(np.float32)  # (N_windows, 288, 11)
 
-    windows = np.concatenate(all_windows, axis=0).astype(np.float32)
+        bolus   = wins[:, :, BOLUS_IDX]
+        carbs   = wins[:, :, CARBS_IDX]
+        cgm     = wins[:, :, CGM_IDX]
 
-    # Filtrar ventanas sin drivers o con CGM demasiado ruidoso
-    bolus = windows[:, :, BOLUS_IDX]
-    carbs = windows[:, :, CARBS_IDX]
-    cgm   = windows[:, :, CGM_IDX]
+        has_driver = ((bolus + carbs) > 0).any(axis=1)
+        cgm_std    = cgm.std(axis=1)
+        cgm_ok     = (cgm_std > 0.3) & (cgm_std < 4.0)
+        keep       = has_driver & cgm_ok
 
-    has_driver = ((bolus + carbs) > 0).any(axis=1)           # al menos un evento
-    cgm_std    = cgm.std(axis=1)
-    cgm_ok     = (cgm_std > 0.3) & (cgm_std < 4.0)           # ni plano ni ruido puro
+        n_before   += len(wins)
+        n_filtered += (~keep).sum()
 
-    mask_keep = has_driver & cgm_ok
-    n_before  = len(windows)
-    windows   = windows[mask_keep]
-    print(f"  Filtradas: {n_before - len(windows):,} ventanas patológicas "
-        f"({(1-len(windows)/n_before)*100:.1f}%)  →  quedan {len(windows):,}")
-    
-    print(f"  Pacientes: {len(npz_files)}   "
-          f"Ventanas: {windows.shape[0]:,}   Shape: {windows.shape}")
-    return windows
+        for i in np.where(keep)[0]:
+            index.append((fpath, int(i)))
 
+    pct = n_filtered / n_before * 100 if n_before > 0 else 0
+    print(f"  Filtered: {n_filtered:,} pathological windows "
+          f"({pct:.1f}%)  →  {len(index):,} remaining")
+    print(f"  Patients: {len(npz_files)}   Windows: {len(index):,}")
+    return index
+
+
+
+def load_windows_from_index(index_sample: list) -> np.ndarray:
+    """Loads specific windows by (filepath, window_idx) from disk into RAM."""
+    windows = []
+    for fpath, win_idx in index_sample:
+        data = np.load(fpath, allow_pickle=True)
+        windows.append(data['windows'][win_idx].astype(np.float32))
+    return np.stack(windows, axis=0)
 
 # ── Save run config ───────────────────────────────────────────────────────────
 
@@ -730,6 +723,7 @@ def save_run_config(results_dir: str, args):
         f.write(f"LR: {LR}\n")
         f.write(f"DRIVER_LOSS_WEIGHT: {DRIVER_LOSS_WEIGHT}\n")
         f.write(f"DRIVER_EFFECT_STEPS: {DRIVER_EFFECT_STEPS}\n")
+        f.write(f"N_FEATURES_MODEL: {10 if getattr(args, 'no_age', False) else N_FEATURES}\n")
     print(f"  Config guardada: {config_path}")
 
 def plot_driver_metrics(model, windows_orig: np.ndarray,
@@ -855,70 +849,130 @@ def main(args):
 
     save_run_config(results_dir, args)
 
-    # 1. Cargar datos
-    print(f"\n  Cargando datos desde: {args.data}")
-    windows = load_windows(args.data, args.max_patients)
+    # 1. Index dataset (reads metadata only — windows never accumulate in RAM)
+    print(f"\n  Indexing dataset from: {args.data}")
+    index = index_dataset(args.data, args.max_patients)
 
-    # 2. Preparar datos
-    print(f"\n{'='*52}")
-    print(f"  Preparando datos")
-    print(f"{'='*52}")
-    (X_train, Y_train), (X_val, Y_val), (X_test, Y_test), \
-        windows_test_orig, masks_test = prepare_data(
-            windows,
-            mask_ratio=args.mask_ratio,
-            mask_min_len=MASK_MIN_LEN,
-            mask_max_len=args.mask_max_len,
-            multimodal_prob=args.multimodal_prob
-        )
+    # 2. Patient-level split (prevents data leakage across splits)
+    all_fpaths = sorted(list(set(fp for fp, _ in index)))
+    n          = len(all_fpaths)
+    perm       = np.random.permutation(n)
+    n_test     = int(n * TEST_SPLIT)
+    n_val      = int(n * VAL_SPLIT)
 
-    # 3. Construir modelo
+    test_set  = set(all_fpaths[i] for i in perm[:n_test])
+    val_set   = set(all_fpaths[i] for i in perm[n_test:n_test + n_val])
+    train_set = set(all_fpaths[i] for i in perm[n_test + n_val:])
+
+    train_index = [(fp, wi) for fp, wi in index if fp in train_set]
+    val_index   = [(fp, wi) for fp, wi in index if fp in val_set]
+    test_index  = [(fp, wi) for fp, wi in index if fp in test_set]
+
+    print(f"  Patient split — Train: {len(train_set)}  Val: {len(val_set)}  Test: {len(test_set)}")
+    print(f"  Window split  — Train: {len(train_index):,}  Val: {len(val_index):,}  Test: {len(test_index):,}")
+
+    # 3. Build tf.data pipelines — lazy loading, masking on-the-fly, no RAM accumulation
+    ds_kwargs = dict(
+        mask_ratio=args.mask_ratio, mask_min_len=MASK_MIN_LEN,
+        mask_max_len=args.mask_max_len, multimodal_prob=args.multimodal_prob,
+        no_logged_events=args.no_logged_events, no_age=args.no_age
+    )
+    train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs)
+    val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
+
+    # 4. Build model
+    n_features_model = 10 if args.no_age else N_FEATURES
     model, encoder = build_mtsm_model(
-        WINDOW_LEN, N_FEATURES, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
+        WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
+    )
+    model.compile(
+        optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+        loss=MaskedMSELoss(shape_loss_lambda=args.shape_loss),
+        metrics=[MaskedMAE()]
     )
     model.summary()
 
-    # 4. Entrenar
-    history = train_model(
-        model, X_train, Y_train, X_val, Y_val,
+    # 5. Train
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10,
+            restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5,
+            patience=5, min_lr=1e-6, verbose=1
+        ),
+    ]
+    history_obj = model.fit(
+        train_ds,
+        validation_data=val_ds,
         epochs=args.epochs,
-        shape_loss_lambda=args.shape_loss
+        callbacks=callbacks,
+        verbose=1
     )
+    history = history_obj.history
 
-    # 5. Plots
+    # 6. Save encoder weights
+    encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
+    encoder.save_weights(encoder_path)
+    print(f"\n  Encoder weights saved: {encoder_path}")
+
+    # 7. Load a bounded test sample for plots (500 windows max)
+    N_PLOT = 500
+    if len(test_index) > N_PLOT:
+        rng_idx    = np.random.choice(len(test_index), N_PLOT, replace=False)
+        plot_index = [test_index[i] for i in rng_idx]
+    else:
+        plot_index = test_index
+
+    print(f"\n  Loading {len(plot_index)} test windows for plots...")
+    test_windows = load_windows_from_index(plot_index)
+    print(f"  Test sample shape: {test_windows.shape}")
+    # When --no_age, strip feature 10 so model input matches training shape.
+    # Feature indices 0-9 (CGM, PI, RA, bolus, carbs, …) are unaffected.
+    if args.no_age:
+        test_windows = test_windows[:, :, :10]
+
+    # 8. Plots
     print(f"\n{'='*52}")
-    print(f"  Generando plots")
+    print(f"  Generating plots")
     print(f"{'='*52}")
+
+    masks_test = np.stack([
+        create_mask(WINDOW_LEN, args.mask_ratio, MASK_MIN_LEN, args.mask_max_len)
+        for _ in range(len(test_windows))
+    ])
 
     plot_training_curves(
         history,
         os.path.join(results_dir, 'training_curves.png')
     )
 
-    variability = (windows_test_orig[:, :, CGM_IDX].max(axis=1)
-                 - windows_test_orig[:, :, CGM_IDX].min(axis=1))
+    variability = (test_windows[:, :, CGM_IDX].max(axis=1)
+                 - test_windows[:, :, CGM_IDX].min(axis=1))
     h_idx = int(np.argmax(variability))
     plot_H_analysis(
         encoder,
-        windows_test_orig[h_idx:h_idx+1],
+        test_windows[h_idx:h_idx+1],
         n_layers=N_LAYERS, n_heads=N_HEADS, d_model=D_MODEL,
         save_path=os.path.join(results_dir, 'transformer_H_analysis.png')
     )
 
     plot_reconstruction_examples(
-        model, windows_test_orig, masks_test,
+        model, test_windows, masks_test,
         mask_ratio=args.mask_ratio,
         mask_min_len=MASK_MIN_LEN,
         mask_max_len=args.mask_max_len,
         save_path=os.path.join(results_dir, 'reconstruction_examples.png')
     )
+
     plot_driver_metrics(
-    model, windows_test_orig, masks_test,
-    save_path=os.path.join(results_dir, 'driver_metrics.png')
+        model, test_windows, masks_test,
+        save_path=os.path.join(results_dir, 'driver_metrics.png')
     )
 
     print(f"\n{'='*52}")
-    print(f"  Completado. Resultados en: {results_dir}/")
+    print(f"  Done. Results in: {results_dir}/")
     print(f"{'='*52}\n")
 
 
@@ -944,5 +998,14 @@ if __name__ == '__main__':
     parser.add_argument('--multimodal_prob', type=float, default=MULTIMODAL_PROB,
                         help='Prob de enmascarar PI o RA en lugar de CGM '
                              '(default 0.0=off | Idea 2: 0.2)')
+    # Ablation: remove discrete logged event features
+    parser.add_argument('--no_logged_events', action='store_true', default=False,
+                        help='Zero out bolus_logged and carbs_logged features — '
+                             'forces model to rely on PI and RA only')
+    # Late fusion: remove age_norm from encoder input
+    parser.add_argument('--no_age', action='store_true', default=False,
+                        help='Drop age_norm (feature 10) from encoder input. '
+                             'Late fusion design: age passed to downstream heads only, '
+                             'not to the encoder, to avoid demographic shortcuts.')
     args = parser.parse_args()
     main(args)
