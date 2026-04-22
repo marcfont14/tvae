@@ -437,8 +437,12 @@ def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
         for pi in order:
             fpath       = fpaths[pi]
             win_indices = np.array(patient_to_windows[fpath], dtype=np.int32)
-            data        = np.load(fpath, allow_pickle=True)
-            wins        = data['windows'][win_indices].astype(np.float32)
+            try:
+                data = np.load(fpath, allow_pickle=True)
+                wins = data['windows'][win_indices].astype(np.float32)
+            except Exception as e:
+                print(f'[WARN] skipping {fpath}: {e}', flush=True)
+                continue
             x_masked, Y = apply_masks_vectorized(
                 wins, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
                 no_logged_events=no_logged_events, no_age=no_age
@@ -520,7 +524,7 @@ def make_paired_window_dataset(index: list, shuffle: bool, mask_ratio: float,
     ds = ds.unbatch()
     if shuffle:
         ds = ds.shuffle(buffer_size=5_000, seed=SEED)
-    ds = ds.batch(BATCH_SIZE)
+    ds = ds.batch(BATCH_SIZE // 2, drop_remainder=True)  # halved + drop_remainder for consistent XLA shapes
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -1123,7 +1127,7 @@ def main(args):
         train_ds = make_paired_window_dataset(train_index, shuffle=True,  **ds_kwargs)
         val_ds   = make_paired_window_dataset(val_index,   shuffle=False, **ds_kwargs)
     else:
-        train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs)
+        train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
         val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
 
     # 4. Build model
@@ -1132,6 +1136,12 @@ def main(args):
         WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT,
         vicreg_lambda=args.vicreg_lambda
     )
+
+    # Cache head layers for contrastive training loop (avoids sub-model retracing)
+    if args.contrastive_lambda > 0.0:
+        _recon_hidden = model.get_layer('recon_hidden')
+        _recon_out    = model.get_layer('reconstruction_head')
+        _recon_shape  = model.get_layer('output')
 
     if vicreg:
         # Multi-output model: add dummy zero target for h_pool output
@@ -1177,15 +1187,31 @@ def main(args):
 
     if contrastive:
         # Custom training loop: MTSM loss + InfoNCE on mean-pooled H pairs
-        infonce     = InfoNCELoss(temperature=0.1)
-        optimizer   = keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4)
+        infonce      = InfoNCELoss(temperature=0.1)
+        optimizer    = keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4)
         mtsm_loss_fn = MaskedMSELoss(shape_loss_lambda=args.shape_loss)
-        mae_metric  = MaskedMAE()
+        mae_metric   = MaskedMAE()
         history = {'loss': [], 'masked_mae': [], 'val_loss': [], 'val_masked_mae': []}
 
         best_val_loss  = float('inf')
         patience_count = 0
         best_weights   = None
+
+        contrastive_lambda_tf = tf.constant(args.contrastive_lambda, dtype=tf.float32)
+
+        def train_step(x_a, x_p, y_a):
+            with tf.GradientTape() as tape:
+                H_a       = encoder(x_a, training=True)
+                recon_a   = _recon_shape(_recon_out(_recon_hidden(H_a, training=True), training=True), training=True)
+                loss_mtsm = mtsm_loss_fn(y_a, recon_a)
+                H_p       = encoder(x_p, training=True)
+                h_a       = tf.reduce_mean(H_a, axis=1)
+                h_p       = tf.reduce_mean(H_p, axis=1)
+                loss_info = infonce(h_a, h_p)
+                loss      = loss_mtsm + contrastive_lambda_tf * loss_info
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            return loss_mtsm, recon_a
 
         for epoch in range(args.epochs):
             print(f"\nEpoch {epoch+1}/{args.epochs}")
@@ -1193,19 +1219,7 @@ def main(args):
             train_loss_sum, train_steps = 0.0, 0
             mae_metric.reset_state()
             for (x_a, x_p), y_a in train_ds:
-                with tf.GradientTape() as tape:
-                    # Reconstruction loss on anchor
-                    recon_a  = model(x_a, training=True)
-                    loss_mtsm = mtsm_loss_fn(y_a, recon_a)
-                    # InfoNCE on mean-pooled H pairs
-                    H_a = encoder(x_a, training=True)
-                    H_p = encoder(x_p, training=True)
-                    h_a = tf.reduce_mean(H_a, axis=1)
-                    h_p = tf.reduce_mean(H_p, axis=1)
-                    loss_info = infonce(h_a, h_p)
-                    loss = loss_mtsm + args.contrastive_lambda * loss_info
-                grads = tape.gradient(loss, model.trainable_variables)
-                optimizer.apply_gradients(zip(grads, model.trainable_variables))
+                loss_mtsm, recon_a = train_step(x_a, x_p, y_a)
                 mae_metric.update_state(y_a, recon_a)
                 train_loss_sum += float(loss_mtsm); train_steps += 1
             history['loss'].append(train_loss_sum / train_steps)
@@ -1244,10 +1258,12 @@ def main(args):
         if best_weights is not None:
             model.set_weights(best_weights)
     else:
+        steps_per_epoch = len(train_index) // BATCH_SIZE
         history_obj = model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=args.epochs,
+            steps_per_epoch=steps_per_epoch,
             callbacks=callbacks,
             verbose=1
         )
