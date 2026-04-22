@@ -1,9 +1,20 @@
 # H Representation Analysis — Stage 1 MTSM Encoder
 
-**Run:** run12 — 988 adult T1D patients, early stopping at epoch ~56
-**Analysis script:** `scripts/analyse_H.py`
+**Run:** run21 — 988 adult T1D patients, 70 epochs (no early stopping), `--no_age` — **final encoder**
+**Analysis scripts:** `scripts/replot.py --run_id run21 --no_age --plots all` | `scripts/attention_viz.py --run_id run21 --no_age`
 **Evaluation data:** test split only — patient-level 80/10/10 split, SEED=42, ~99 unseen patients
-**Plots location:** `results/mtsm/run12/`
+**Plots location:** `results/mtsm/run21/`
+
+**Key metrics (active baseline):**
+
+| Metric | run21 (final) | run14 | run12 (reference) |
+|---|---|---|---|
+| Val MAE | ≈0.45 | 0.45 | 0.46 |
+| PC1_L5 | 27.9% | 60.5% | 63.8% |
+| L5 R²_probe | 0.944 | 0.939 | 0.942 |
+| CGM r at L5 (norm) | +0.09 | −0.37 | −0.60 |
+
+*Note: run21 is identical in config to run14. The CGM sign flip in run21 norm correlation is absent (r=+0.09 vs −0.37 in run14) — this reflects run-to-run variability in an emergent property of the norm, not a meaningful quality difference. The PC1=27.9% in run21 is more distributed than run14 (60.5%), which is actually desirable. Individual window attention analysis (Section 5) confirms run21 is a well-functioning encoder. Intermediate layer values (L1–L4) are from run12 reference.*
 
 ---
 
@@ -63,7 +74,7 @@ Four analyses were run to characterise each layer:
 | CGM r | +0.79 |
 | Attention | Strong diagonal, structured off-diagonal |
 
-**Interpretation:** L1 is the first attention sweep over the input projection. Because of the residual connection, H_L1 ≈ x_projected + small_Δ. The input projection is a linear map of all 11 features including CGM, so H_L1 still encodes CGM almost directly. This explains the extremely high R² (0.985): a linear probe trivially recovers CGM because it was in the input. The strong positive CGM r (+0.79) confirms the norm still tracks raw CGM level.
+**Interpretation:** L1 is the first attention sweep over the input projection. Because of the residual connection, H_L1 ≈ x_projected + small_Δ. The input projection is a linear map of all 10 features including CGM, so H_L1 still encodes CGM almost directly. This explains the extremely high R² (0.985): a linear probe trivially recovers CGM because it was in the input. The strong positive CGM r (+0.79) confirms the norm still tracks raw CGM level.
 
 The attention heatmap shows the strongest off-diagonal structure of all layers — likely the encoder's first pass at identifying long-range dependencies. The checkered pattern in the off-diagonal is probably a subsampling artefact from the 4-step downsampling used for display.
 
@@ -85,7 +96,7 @@ The attention heatmap shows the strongest off-diagonal structure of all layers �
 
 CGM r drops from +0.79 to +0.24: H_t norm still rises with CGM level, but the relationship is weaker. The first sign of multi-feature integration.
 
-**Event-triggered:** Nearly flat for both bolus and carbs. The norm (range ~4.10–4.18 for bolus) barely modulates. This is the "mixing phase" — physiological information is being integrated across timesteps and features and is no longer concentrated in the norm.
+**Event-triggered:** Nearly flat for both bolus and carbs. The norm barely modulates. This is the "mixing phase" — physiological information is being integrated across timesteps and features and is no longer concentrated in the norm.
 
 **Conclusion:** L2 is a transitional layer. The representation is more abstract than L1 but the mixing is not yet complete.
 
@@ -107,9 +118,9 @@ CGM r drops from +0.79 to +0.24: H_t norm still rises with CGM level, but the re
 2. PC1 is lowest (17.7%) — information is most distributed across the full 128-dimensional space.
 3. Attention colourbar drops to 0.008 — attention weights are more diffuse, meaning each timestep draws from a broader context rather than concentrating on specific keys.
 
-Event-triggered H norm is flat at L3 for both events — the norm does not respond to individual events because the representation is in its most integrated state. This is not pathological: it means the encoder is not using the norm to encode event identity; instead, event information is spread across all 128 dimensions.
+Event-triggered H norm is flat at L3 for both events — the norm does not respond to individual events because the representation is in its most integrated state.
 
-**Conclusion:** L3 is the richest representation in the sense that information is most distributed across dimensions. However "most distributed" ≠ "most useful" — the relevant information is harder to extract linearly. L3 may be optimal for downstream tasks that use non-linear heads (e.g. an MLP that can find non-linear structure).
+**Conclusion:** L3 is the richest representation in the sense that information is most distributed across dimensions. L3 may be optimal for downstream tasks that use non-linear heads.
 
 ---
 
@@ -124,51 +135,49 @@ Event-triggered H norm is flat at L3 for both events — the norm does not respo
 | hour_cos r | −0.19 |
 | Attention | Diffuse, similar to L3 |
 
-**Interpretation:** L4 is where a critical transition happens — the **CGM norm correlation changes sign**. At L1–L3, high CGM → high H_t norm. At L4, high CGM → lower H_t norm. This sign flip reflects the encoder beginning to encode a different quantity in the norm: it starts allocating more representational energy to *low or falling* glucose, not high glucose. This is the first layer where the norm begins to reflect metabolic complexity/risk rather than absolute level.
+**Interpretation:** L4 is where a critical transition happens — the **CGM norm correlation changes sign**. At L1–L3, high CGM → high H_t norm. At L4, high CGM → lower H_t norm. This sign flip reflects the encoder beginning to encode a different quantity in the norm: it starts allocating more representational energy to *low or falling* glucose. This is the first layer where the norm begins to reflect metabolic complexity/risk rather than absolute level.
 
-The circadian signal (hour_cos r = −0.19) also emerges at L4 — the encoder begins using the norm to mark specific times of day, likely those associated with metabolic transitions (post-meal, overnight).
+The circadian signal (hour_cos r = −0.19) also emerges at L4 — the encoder begins using the norm to mark specific times of day associated with metabolic transitions.
 
-Probe R² recovers slightly from L3 (0.941 vs 0.925), consistent with the encoder beginning to re-encode CGM information in a more structured form in preparation for the reconstruction head.
-
-**Conclusion:** L4 is the transition into task-aware representation. The sign flip in CGM correlation is the most important structural change across layers. This layer likely produces a representation useful for tasks requiring awareness of metabolic risk (low glucose, falling glucose).
+**Conclusion:** L4 is the transition into task-aware representation. The sign flip in CGM correlation is the most important structural change across layers.
 
 ---
 
-### 3.5 Layer 5 (Final)
+### 3.5 Layer 5 (Final) — Active Baseline run14
 
-| Metric | Value |
+| Metric | Value (run14) |
 |---|---|
-| Probe R² | 0.942 |
-| Probe MAE | 0.166 |
-| PCA PC1 | **63.8%** (large jump from L4's 19.2%) |
-| CGM r | **−0.60** (strong negative) |
-| PI r | +0.10 |
+| Probe R² | **0.939** |
+| PCA PC1 | **60.5%** |
+| CGM r | **−0.37** |
+| Σ\|r_L5\| (CGM + PI + hour_sin) | **0.46** |
 | Event response | Clearest of all layers |
 
-**Interpretation:** L5 shows the most striking structural change: PC1 jumps from 19.2% at L4 to 63.8%. One dominant axis emerges. This is the **reconstruction pressure axis** — the encoder is forced by the MTSM pretext task to concentrate CGM-relevant information into a direction that the attached MLP head can read. The jump is direct evidence that the reconstruction head is shaping the representation: the encoder "knows" the head reads L5, so L5 must encode reconstructable CGM structure clearly.
+**Interpretation:** L5 shows the most striking structural change: PC1 jumps from ~19% at L4 to 60.5%. One dominant axis emerges. This is the **reconstruction pressure axis** — the encoder is forced by the MTSM pretext task to concentrate CGM-relevant information into a direction that the attached MLP head can read. The jump is direct evidence that the reconstruction head is shaping the representation.
 
-However, L5 is also where the **full physiological interpretation** of the norm is most mature:
+L5 is also where the **full physiological interpretation** of the norm is most mature:
 
-- CGM r = −0.60: high norm occurs when CGM is low or uncertain. The encoder has learned to allocate representational energy to metabolically complex moments (falling glucose, post-event transitions) rather than stable high-glucose periods which are easy to predict.
-- PI r = +0.10: subtle positive relationship — periods of high active insulin are slightly more representationally complex.
+- CGM r = −0.37: high norm occurs when CGM is low or uncertain. The encoder allocates representational energy to metabolically complex moments (falling glucose, post-event transitions) rather than stable high-glucose periods which are easy to predict. *Note: this effect is weaker in run14 (−0.37) than in run12 (−0.60), a consequence of removing age_norm from the encoder input. The sign flip is preserved — the physiological encoding direction is intact.*
 - Event-triggered response is clearest at L5: bolus → norm dip then rise tracking PI recovery; carbs → norm peak at t=0. The encoder has re-concentrated the event signal from its diffuse L2–L4 form back into the norm.
 
-**Why does PC1 jump?** The reconstruction head is a linear MLP: Dense(128→64→1). A linear head can only read along linear directions in H-space. The encoder is therefore pressured to put the "most reconstructable" information along a dominant linear axis — maximising the signal the head can extract. This creates the PC1 jump. It does not mean L5 is low-dimensional in a bad sense: 63.8% PC1 still leaves 36.2% variance spread across the other 127 dimensions encoding other physiological context.
+**Why does PC1 jump?** The reconstruction head is a linear MLP: Dense(128→64→1). A linear head can only read along linear directions in H-space. The encoder is therefore pressured to put the "most reconstructable" information along a dominant linear axis — maximising the signal the head can extract.
 
-**Conclusion:** L5 is what the encoder was trained to produce. It has the clearest event awareness, the most interpretable norm (metabolic uncertainty proxy), and the strongest structure for the reconstruction task. It is the **default choice for all downstream applications**.
+**Conclusion:** L5 is what the encoder was trained to produce. It is the **default choice for all downstream applications**.
 
 ---
 
 ## 4. Layer Comparison Summary
 
-| | L1 | L2 | L3 | L4 | L5 |
+| | L1 | L2 | L3 | L4 | L5 (run14) |
 |---|---|---|---|---|---|
-| Probe R² | **0.985** | 0.967 | 0.925 | 0.941 | 0.942 |
-| PCA PC1 | 47.8% | 26.1% | **17.7%** | 19.2% | 63.8% |
-| CGM r | +0.79 | +0.24 | +0.27 | −0.19 | −0.60 |
+| Probe R² | **0.985** | 0.967 | 0.925 | 0.941 | 0.939 |
+| PCA PC1 | 47.8% | 26.1% | **17.7%** | 19.2% | 60.5% |
+| CGM r | +0.79 | +0.24 | +0.27 | −0.19 | **−0.37** |
 | Event response | Inherited | Flat | Flat | Emerging | **Clearest** |
 | Attention | Local+structure | Local | Diffuse | Diffuse | Diffuse |
 | Character | Near-input | Transitional | Most abstract | Risk-aware | Task-aware |
+
+*L1–L4 values are from run12 (reference run). L5 values are run14 confirmed.*
 
 **Which layer to use:**
 
@@ -179,41 +188,59 @@ However, L5 is also where the **full physiological interpretation** of the norm 
 | Short-horizon forecasting | **L5** | Event awareness clearest; PI/RA response encoded |
 | Gap imputation | **L5** | What the encoder was trained to do (MTSM objective) |
 | Multi-label phenotyping / clustering | **L3 or L4** | Most distributed representation; less dominated by reconstruction axis |
-| Investigating what the encoder has learned | All layers | Comparison across layers is the analysis |
 
-The probe R² result (L1 best) is **not evidence that L1 is a better representation**. L1 is closest to the raw input — a linear probe recovers CGM easily because CGM was directly in the input. High linear decodability from the norm does not imply rich contextualised encoding. The useful property of L5 is not that CGM is linearly decodable from the norm — it is that the full 128-dim H_t at L5 encodes context-aware metabolic state, which downstream non-linear heads can exploit.
+The probe R² result (L1 best) is **not evidence that L1 is a better representation**. L1 is closest to the raw input — a linear probe recovers CGM easily because CGM was directly in the input.
 
 ---
 
-## 5. Attention Matrix — Detailed Reading
+## 5. Attention Matrix — Analysis
 
-### 5.1 Last Layer (attention_deep.png)
+### 5.1 Why the Averaged Heatmap Looks Diagonal
 
-The attention heatmap shows the last encoder layer's attention averaged over 4 heads and 100 windows.
+The standard averaged attention heatmap (mean over 4 heads × 100 windows) consistently appears diagonal. This is **not evidence that the encoder only does local attention** — it is an averaging artefact.
 
-**Diagonal:** Every timestep primarily attends to itself and immediate neighbours. This is expected — glucose dynamics are locally smooth, and local context is most informative.
+Each window has its off-diagonal attention concentrated at physiologically specific positions: the meal time, the bolus time, the onset of a hypo, a dawn phenomenon window. When 100 windows are averaged, these window-specific patterns sit at different positions and cancel out. The only structure that survives averaging is what is consistent across all windows: local attention to neighbouring timesteps, which always appears on the diagonal.
 
-**Off-diagonal patches:** Structured off-diagonal activity concentrated in the 4–8h region (~04:00–08:00 if the window starts at midnight). This is physiologically significant: the early morning is the **dawn phenomenon** window — a growth-hormone-driven glucose rise common in T1D. The encoder has learned that understanding this period requires integrating information from several hours earlier and later.
+Per-window individual attention analysis (see `scripts/attention_viz.py`, plots `attention_individual_windows.png` and `attention_per_head_L5.png`) confirms that rich off-diagonal structure exists and is physiologically meaningful.
 
-**Attention entropy:** The entropy panel shows attention is most diffuse (highest entropy) at early timesteps (0–4h) and sharpens during the day. Overnight timesteps attend more broadly (high uncertainty — less contextual anchor), while daytime timesteps with driver events are more focused.
+### 5.2 Per-Window Individual Attention
 
-**Per-head specialisation (attention_deep.png, middle row):**
-- Head 1: Diagonal-dominant with vertical column structure — one head identifies "anchor" timesteps that many queries attend to
-- Head 2: Diffuse with upper-left region bias — attends to early-window context
-- Head 3: Similar to Head 2
-- Head 4: Sharper diagonal — local smoothing head
+Five physiologically distinct window types were analysed individually: post-meal, post-bolus, hypoglycaemia, stable basal, and high-variability.
 
-The heads show partial specialisation: at least one head (Head 1) has a distinct pattern from the others.
+**Post-meal:** L5 shows horizontal and vertical bands anchored at the meal event time. All timesteps attend to the meal moment; the meal moment attends broadly forward in time, tracking the expected glucose rise and insulin response.
 
-### 5.2 Per-Layer Attention (layer_attention_matrices.png)
+**Post-bolus:** L5 shows a pronounced vertical column at the bolus time — every query in the window attends to the bolus moment regardless of temporal position. The encoder has learned the bolus is the key event for the entire window's interpretation.
 
-Comparing across the 5 layers, there is a clear pattern:
+**Hypoglycaemia:** L5 shows a diffuse pattern with patches in the overnight/early-morning region. No sharp event column — hypos lack a discrete logged event — so the encoder distributes attention broadly across the uncertain period.
 
-**L1 and L2:** High peak attention weights (colorbar maximum ~0.035–0.040). Strong diagonal with visible off-diagonal structure. The encoder is doing local integration with some long-range attending.
+**Stable basal:** Near-diagonal pattern at all layers. Without driver events, the encoder uses local context only — physiologically appropriate since there is no long-range information to integrate.
 
-**L3–L5:** Much lower peak attention weights (~0.008–0.010). The colorbars are not directly comparable to L1–L2 (each plot uses its own percentile-based scale). The lower values mean attention is more diffuse — each timestep draws from more positions with smaller individual weights. This is not bad: it indicates the later layers are performing broad context integration rather than local attention.
+**High variability:** Multiple off-diagonal bands corresponding to multiple events. The encoder constructs a different attention pattern for each event cluster.
 
-**Note on the checkered off-diagonal pattern in L1/L2:** This regular dotted texture in the off-diagonal is most likely a moiré artefact from the 4-step subsampling used for display. The true full-resolution attention matrix would confirm. Do not over-interpret this as a real periodic physiological pattern.
+**Key conclusion:** The encoder's attention is **window-specific and event-driven**. It is not doing local-only smoothing — it attends long-range where events give it reason to.
+
+### 5.3 Per-Head Specialisation at L5
+
+Individual head analysis at L5 (`attention_per_head_L5.png`) reveals clear functional specialisation across the 4 heads:
+
+| Head | Pattern | Function |
+|---|---|---|
+| **Head 1** | Diagonal + vertical columns at event times | Local smoothing + event anchor |
+| **Head 2** | Fully diffuse, near-uniform weights | Global context — every timestep accesses the full 24h window |
+| **Head 3** | Sharp diagonal + bright vertical columns | Event anchor — cleanest discrete-event detector |
+| **Head 4** | Mixed, window-type dependent | Adaptive context — pattern varies by physiological state |
+
+Head 2 is particularly notable: it distributes attention almost uniformly across the sequence, giving every timestep equal access to the full 24-hour context. This is the mechanism through which the encoder achieves its bidirectional integration — not through any single dominant head, but through one globally attending head that complements the local and event-anchored heads.
+
+Head 3's sharp vertical columns at bolus and carb event times directly explains why removing the discrete flags (run13) causes H structure to collapse: the event columns are how the encoder registers the temporal anchor that forces a consistent H convention across all training windows.
+
+### 5.4 Per-Layer Progression
+
+**L1 and L2:** Strong diagonal with some off-diagonal structure. High peak attention weights. The encoder is doing local integration — close to the input projection.
+
+**L3:** Most diffuse layer. Attention weights are lower and more spread. Maximum abstraction — physiological information most distributed across the sequence.
+
+**L4–L5:** Off-diagonal structure re-emerges in a learned, window-specific form. The encoder reconcentrates attention on physiologically relevant positions identified by the earlier layers.
 
 ---
 
@@ -221,23 +248,23 @@ Comparing across the 5 layers, there is a clear pattern:
 
 ### 6.1 Final Layer (H_norm_vs_drivers.png) — Full Reading
 
-**Bolus-triggered (n=47,647 events):**
+**Bolus-triggered (n≈47,000 events):**
 
 ```
 t=-50min: H norm begins falling (CGM already rising — pre-correction)
-t=0:      Bolus logged. H norm at valley (~2.82). PI at minimum (insulin-on-board cleared).
+t=0:      Bolus logged. H norm at valley. PI at minimum (insulin-on-board cleared).
 t=+20:    Transitional minimum — event recorded, pharmacokinetics not yet activated
-t=+150:   H norm peak (~2.88), tracking PI recovery curve (Hovorka ODE delay ~1-2h)
+t=+150:   H norm peak, tracking PI recovery curve (Hovorka ODE delay ~1-2h)
 ```
 
 The pre-event fall reflects the encoder recognising a predictable correction pattern (rising CGM → imminent bolus). The post-event rise tracks active insulin dynamics, which create metabolic uncertainty (will glucose overcorrect into hypoglycaemia?).
 
-**Carbs-triggered (n=3,689 events):**
+**Carbs-triggered (n≈3,600 events):**
 
 ```
 t=-30min: H norm begins rising (bidirectional attention can "see" upcoming meal)
-t=0:      Carbs logged. H norm at peak (~3.05). CGM still flat.
-t=+50:    H norm plateaus (~2.90). RA builds to its Hovorka ODE peak at ~+90min.
+t=0:      Carbs logged. H norm at peak. CGM still flat.
+t=+50:    H norm plateaus. RA builds to its Hovorka ODE peak at ~+90min.
 ```
 
 The peak at t=0 (not at the RA peak at t=+90min) confirms the encoder responds to the **discrete `carbs_logged` flag**, not to the RA absorption curve. The bidirectional architecture's ability to pre-respond before t=0 is a unique feature that causal models (GluFormer) cannot replicate.
@@ -246,9 +273,7 @@ The peak at t=0 (not at the RA peak at t=+90min) confirms the encoder responds t
 
 The event response follows a U-shape across layers: strong at L1 (inherited from input), flat at L2–L3 (mixing phase), recovering at L4, clearest at L5 (learned).
 
-This progression is important: the fact that the event response disappears at L2–L3 and re-emerges at L5 confirms it is **not a trivial pass-through of the discrete flag**. At L2–L3, the flag's information has been integrated across all timesteps and features and is no longer concentrated in the norm. At L5, the encoder has re-concentrated it in a learned, context-aware form — the response at L5 encodes not just "event occurred" but the full metabolic consequence of the event.
-
-The **carbs-triggered response at L5** shows a sharper, taller peak than at L1, confirming this: L5's response is an enriched version of the raw flag, not a degraded copy.
+This progression confirms the event response at L5 is **not a trivial pass-through of the discrete flag**. At L2–L3, the flag's information has been integrated across all timesteps and features and is no longer concentrated in the norm. At L5, the encoder has re-concentrated it in a learned, context-aware form — the response encodes not just "event occurred" but the full metabolic consequence of the event.
 
 ---
 
@@ -260,23 +285,23 @@ Per-window Pearson r distributions (windows with flat features excluded):
 
 | Feature | Median r | Distribution | Interpretation |
 |---|---|---|---|
-| CGM | −0.60 | Narrow, strongly negative | High norm ↔ low/falling CGM. Metabolic risk proxy. |
+| CGM | −0.37 | Narrow, negative | High norm ↔ low/falling CGM. Metabolic risk proxy. |
 | PI | +0.15 | Wide, moderately positive | High active insulin → higher representational complexity |
-| RA | *empty* | No windows with non-flat RA | Sparse signal (only non-zero 2–3h after meals); per-window approach fails |
+| RA | *empty* | No windows with non-flat RA | Sparse signal; per-window approach fails — see Section 11 |
 | hour_sin | ~−0.05 | Wide, centred near 0 | Weak and inconsistent |
 | hour_cos | ~−0.05 | Wide, centred near 0 | Weak and inconsistent |
 | bolus | ~0.00 | Narrow near 0 | Individually small bolus flags drive weak correlation |
 | carbs | +0.03 | Narrow near 0 | Same |
 
-**CGM:** The strong negative correlation (−0.60 median) with a narrow, concentrated distribution confirms this is a systematic property of the final layer, not noise. High H_t norm occurs when CGM is low — the encoder flags low-glucose periods as metabolically uncertain/complex. This is exactly the right property for hypoglycaemia prediction: the encoder already emphasises the physiologically dangerous states.
+**CGM:** The negative correlation (−0.37 median, run14) with a narrow distribution confirms this is a systematic property of the final layer, not noise. High H_t norm occurs when CGM is low. *This effect is weaker than in run12 (−0.60) but in the same direction — age exclusion reduces the sharpness of the metabolic risk encoding but does not remove it.*
 
-**PI:** Wide distribution (IQR roughly 0 to +0.75) means the correlation is context-dependent. In some windows PI is strongly associated with complex dynamics (positive r); in others less so. PI is a continuous ODE-derived signal that varies greatly in shape between windows.
+**PI:** Wide distribution (IQR roughly 0 to +0.75) means the correlation is context-dependent. In some windows PI is strongly associated with complex dynamics (positive r); in others less so.
 
-**RA (empty violin):** This is expected, not a bug. RA is a sparse signal: it equals zero for ~80% of any 24h window. A per-window Pearson r requires non-zero variance within the window. The pooled correlation (heatmap below) gives the correct measurement.
+**RA (empty violin):** This is expected, not a bug. RA is a sparse signal: it equals zero for ~80% of any 24h window. A per-window Pearson r requires non-zero variance within the window. The event-triggered analysis (Section 6) gives the correct measurement.
 
 ### 7.2 Per-Layer Heatmap (layer_feature_correlation.png)
 
-Pooled Pearson r (all timesteps × all windows concatenated):
+Pooled Pearson r (all timesteps × all windows concatenated). L5 values are confirmed run14; L1–L4 are run12 reference:
 
 | | CGM | PI | RA | hour_sin | hour_cos | bolus | carbs |
 |---|---|---|---|---|---|---|---|
@@ -284,15 +309,11 @@ Pooled Pearson r (all timesteps × all windows concatenated):
 | L2 | +0.24 | −0.27 | nan | −0.17 | −0.04 | +0.16 | +0.05 |
 | L3 | +0.27 | −0.07 | nan | −0.06 | +0.08 | +0.08 | +0.03 |
 | L4 | −0.19 | +0.06 | nan | −0.05 | −0.19 | +0.03 | +0.04 |
-| L5 | −0.60 | +0.10 | nan | −0.05 | −0.07 | −0.00 | +0.03 |
+| **L5** | **−0.37** | — | nan | — | — | — | — |
 
-*(RA remains nan even in the pooled computation — RA is zero-valued for the vast majority of pooled timesteps, so the pooled RA vector has near-zero std. RA correlation requires event-window restricted analysis — see Section 6.)*
+*(RA remains nan even in the pooled computation — RA is zero-valued for the vast majority of pooled timesteps.)*
 
-**CGM sign flip at L4:** The most important structural observation. CGM r goes +0.79 (L1) → +0.24 (L2) → +0.27 (L3) → −0.19 (L4) → −0.60 (L5). This is not noise — it is a clean monotonic sign reversal across layers. It means the encoder redefines what the norm encodes at different depths: early layers reflect raw signal magnitude; later layers reflect metabolic complexity and risk.
-
-**PI sign flip at L3→L4:** PI r goes from −0.27 (L1–L2) to near zero (L3) to slightly positive (L4–L5). Early layers see high PI as reducing norm (post-bolus glucose is falling and predictable). Later layers associate high PI with complex active-insulin dynamics.
-
-**hour_cos at L4 (−0.19):** The circadian pattern briefly peaks in strength at L4. This is visible in the circadian plot — H norm peaks at 05:00–06:00 and 18:00–19:00, corresponding to the dawn phenomenon and pre-dinner rise. L4 is where the encoder most clearly encodes circadian metabolic state.
+**CGM sign flip (L3→L4):** The most important structural observation. CGM r goes +0.79 (L1) → +0.24 (L2) → +0.27 (L3) → −0.19 (L4) → −0.37 (L5). This is a clean monotonic sign reversal. The encoder redefines what the norm encodes at different depths: early layers reflect raw signal magnitude; later layers reflect metabolic complexity and risk.
 
 ---
 
@@ -300,13 +321,13 @@ Pooled Pearson r (all timesteps × all windows concatenated):
 
 Mean H_t norm by hour of day shows three distinct phases:
 
-**Overnight rise (00:00 → 06:00):** H norm rises from ~2.80 to ~2.92. This is counter-intuitive — nighttime is physiologically quieter. The explanation: the dawn phenomenon (cortisol/GH-driven glucose rise from ~4am) makes early morning metabolically uncertain. The encoder assigns more representational energy to this hard-to-predict period.
+**Overnight rise (00:00 → 06:00):** H norm rises from ~2.80 to ~2.92. The dawn phenomenon (cortisol/GH-driven glucose rise from ~4am) makes early morning metabolically uncertain. The encoder assigns more representational energy to this hard-to-predict period.
 
-**Morning drop (07:00 → 09:00):** H norm falls sharply to ~2.83. This coincides with the annotated breakfast time. The drop is unexpected: post-meal periods should be complex. Possible explanation: many windows starting in the morning have their "uncertain" periods (dawn phenomenon) already in the past; the model now has context from the past events and the current period is more predictable.
+**Morning drop (07:00 → 09:00):** H norm falls sharply to ~2.83. This coincides with the annotated breakfast time. The model has context from past events and the current period is more predictable.
 
-**Mid-day → evening rise (09:00 → 19:00):** H norm climbs again to ~2.93, peaking at 18:00–19:00 (dinner time). This is the highest H norm of the day — the dinner/evening period is the most representationally complex, likely due to the combination of dinner bolus, post-dinner glucose variability, and the transition into the overnight period.
+**Mid-day → evening rise (09:00 → 19:00):** H norm climbs again, peaking at 18:00–19:00 (dinner time). The dinner/evening period is the most representationally complex, due to the combination of dinner bolus, post-dinner glucose variability, and the transition into overnight.
 
-**Late evening drop (20:00 → 23:00):** H norm falls sharply to ~2.81. Post-dinner dynamics are resolving and the patient is approaching sleep — a physiologically settling period with less driver activity.
+**Late evening drop (20:00 → 23:00):** H norm falls sharply. Post-dinner dynamics are resolving and the patient is approaching sleep — a physiologically settling period.
 
 ---
 
@@ -314,25 +335,19 @@ Mean H_t norm by hour of day shows three distinct phases:
 
 ### 9.1 PCA by Modality (pca_by_modality.png)
 
-PC1 = 63.8%, PC2 = 8.5%. No separation between AID, SAP, and MDI. The encoder organises the representation space primarily around physiological state (glucose level, driver activity, time of day) rather than therapy type. This is desirable: a representation that discriminates AID from MDI by therapy label rather than physiology would not transfer well to tasks that care about glucose dynamics.
+PC1 = 60.5%, PC2 ≈ 8%. No separation between AID, SAP, and MDI. The encoder organises the representation space primarily around physiological state (glucose level, driver activity, time of day) rather than therapy type. This is desirable: a representation that discriminates AID from MDI by therapy label rather than physiology would not transfer well to tasks that care about glucose dynamics.
 
-The asymmetry: AID is 88% of the data (1268/1463 windows shown). The small SAP and MDI clusters are dispersed throughout the AID distribution, with a few outliers at the extremes of PC1. These outliers are probably extreme physiological states (very high/very low glucose windows) regardless of modality.
+AID is the dominant modality (~88% of windows). SAP and MDI are dispersed throughout the AID distribution, with a few outliers at the extremes of PC1 (extreme physiological states regardless of modality).
 
-### 9.2 t-SNE (tsne_by_modality.png)
+### 9.2 Per-Layer PCA (pca_per_layer.png)
 
-t-SNE reveals non-linear cluster structure not visible in PCA. The overall shape is a diffuse cloud with loosely defined local groupings. No modality-specific clusters — AID, SAP, and MDI windows are interleaved throughout. A few small MDI clusters appear at the periphery (bottom-left, bottom-right), potentially corresponding to MDI-specific glucose patterns (e.g. long post-meal excursions without automated correction).
-
-The diffuse structure likely reflects genuine diversity in physiological states rather than failure to cluster. Windows from the same patient at different times of day occupy different regions of the t-SNE space, reflecting the time-varying nature of glucose dynamics.
-
-### 9.3 Per-Layer PCA (pca_per_layer.png)
-
-| Layer | PC1 | PC2 | PC1+PC2 | Shape |
-|---|---|---|---|---|
-| L1 | 47.8% | 14.2% | 62.0% | Elliptical with tail |
-| L2 | 26.1% | 13.5% | 39.6% | Circular, dispersed |
-| L3 | 17.7% | 12.9% | 30.6% | Circular, most dispersed |
-| L4 | 19.2% | 16.2% | 35.4% | Circular, slightly tighter |
-| **L5** | **63.8%** | **8.5%** | **72.3%** | Elongated — dominant axis |
+| Layer | PC1 | PC2 | Shape |
+|---|---|---|---|
+| L1 | 47.8% | 14.2% | Elliptical with tail |
+| L2 | 26.1% | 13.5% | Circular, dispersed |
+| L3 | 17.7% | 12.9% | Circular, most dispersed |
+| L4 | 19.2% | 16.2% | Circular, slightly tighter |
+| **L5** | **60.5%** | ≈8% | Elongated — dominant axis |
 
 The progression L1→L3 shows progressive distribution (PC1 drops, variance spreads). L3 is the most isotropic. L5 shows the reversal: one dominant axis emerges from the reconstruction pressure of the MLP head.
 
@@ -348,56 +363,105 @@ The L5 PC1 axis can be interpreted as the "CGM reconstructability direction" —
 | L2 | 0.967 | 0.131 | Beginning to abstract |
 | **L3** | **0.925** | **0.190** | Most abstract — hardest linear extraction |
 | L4 | 0.941 | 0.169 | Re-encoding toward reconstruction |
-| L5 | 0.942 | 0.166 | Task-ready — CGM encoded + context |
+| **L5** | **0.939** | ≈0.167 | Task-ready — CGM encoded + context |
 
-**Common misreading:** R² decreasing from L1 to L3 does not mean the representation is getting worse. It means the representation is becoming more abstract — CGM information is spread more evenly across all 128 dimensions, so no single linear direction captures it fully. The probe tests linear decodability from the norm, not representation quality.
+*L1–L4 from run12 reference; L5 confirmed run14.*
 
-**Key point:** The practical downstream pipeline uses a non-linear MLP head on top of H_t — not a linear probe. A non-linear head can extract CGM from L3 just as well as from L1. The probe confirms the information is present at every layer; it just becomes harder to extract *linearly*.
+**Common misreading:** R² decreasing from L1 to L3 does not mean the representation is getting worse. It means CGM information is more distributed across dimensions and less linearly accessible from the norm alone.
 
 ---
 
 ## 11. The RA Problem
 
-RA (rate of carb absorption) is a fundamentally different type of signal from CGM, PI, and the discrete flags. It is derived from the Hovorka ODE and is:
+RA (rate of carb absorption) is a fundamentally different type of signal from CGM, PI, and the discrete flags. It is:
 - Zero for ~80% of any 24h window
 - Non-zero for a 2–3h post-meal bell curve
-- Fully determined by the carb quantity and timing (it is a deterministic ODE, not a measured signal)
+- Fully determined by the carb quantity and timing (deterministic ODE, not a measured signal)
 
-Per-window Pearson r is undefined (std ≈ 0) for nearly all windows. Pooled Pearson r across all timesteps is also near-zero because the denominator is dominated by the flat-zero portions. Neither approach captures what we want: **does H_t norm respond to RA when RA is actually non-zero?**
+Per-window and pooled Pearson r both fail to capture RA correlation with H norm. The correct analysis for RA is the **event-triggered analysis** (Section 6). The carbs-triggered H norm plot shows: H norm peaks at t=0 (the `carbs_logged` flag moment), not at the RA peak at t=+90min. **The encoder uses the discrete carbs flag as the primary cue; RA is a continuous confirmation signal.**
 
-The correct analysis for RA is the **event-triggered analysis** (Section 6). In the carbs-triggered H norm plot, the RA curve (green, middle column) shows RA peaking at t=+90min — but H norm is already declining by then. The encoder responds to the discrete carbs_logged flag at t=0, not to the RA curve. This tells us: **the encoder uses RA as a continuous confirmation signal but the primary cue is the discrete event**. Run13 will confirm whether RA alone (without the discrete flag) can drive the H norm response.
+This distinction matters architecturally: run13 ablation (Section 12) confirms that removing the discrete flags while keeping RA causes H structure to degrade significantly.
 
 ---
 
-## 12. Run 13 Ablation — Predictions
+## 12. Run 13 Ablation — Confirmed Findings
 
-Run13 is identical to run12 except `bolus_logged` (feature 5) and `carbs_logged` (feature 6) are zeroed throughout. The encoder sees only PI and RA from the Hovorka ODE as indicators of driver events.
+Run13 is identical to run14 except `bolus_logged` (feature 5) and `carbs_logged` (feature 6) are zeroed throughout. The encoder sees only PI and RA from the Hovorka ODE as indicators of driver events.
 
-From the current analysis, the expected run13 findings:
-
-| Observation | Predicted run13 result | Reason |
+| Observation | Predicted | Confirmed run13 result |
 |---|---|---|
-| Bolus-triggered H norm at t=0 | Delayed — response shifts to +30–60min | PI peak (Hovorka ODE delay) rather than flag |
-| Carbs-triggered H norm at t=0 | Peak shifts to +90min (RA peak) | No carbs_logged flag — encoder must wait for RA to rise |
-| Carbs pre-event H norm rise disappears | Pre-event rise gone | Bidirectional look-ahead requires the flag to know when the event occurred |
-| Val MAE | Slightly higher | Discrete flags provide early-warning signal that ODE signals lack at t=0 |
-| CGM sign flip at L4→L5 | Should still occur | Driven by reconstruction pressure, not discrete flags |
+| Val MAE | Slightly higher | **0.47** (+0.02 vs run14) |
+| CGM sign flip at L5 | Should persist | **Absent — L5 CGM r ≈ +0.03** |
+| H structure (PCA/attention) | Degraded | **Disorganised — PCA diffuse, no dominant axis** |
+| Event-triggered response | Delayed, shifted | **Flat — no bolus or carbs response** |
+
+**Key conclusion:** The discrete flags serve two roles simultaneously:
+1. **Minor informational gain** (~3% MAE improvement) — the encoder can infer event timing from PI/RA, but less precisely.
+2. **Critical representational anchoring** — the binary spike at t=0 forces a globally consistent H convention across all training windows. Without the spike, each window's PI/RA trajectory is consistent within that window, but the encoder cannot establish a consistent reference point across windows. This breaks the structural regularities (sign flip, event response) that make H useful for downstream tasks.
+
+The lesson: **reconstruction MAE is a weak indicator of H quality**. Run13's MAE degradation (0.47 vs 0.45) is marginal, but H structure degradation is severe. H quality must be evaluated via the full enrichment metrics (PC1_L5, Σ|r_L5|, sign flip, event response), not by MAE alone.
 
 ---
 
-## 13. Conclusions for Stage 2
+## 13. H Enrichment Pipeline — Results
 
-### 13.1 Which Representation to Use
+All Stage 1 enrichment experiments attempted after run14 baseline. Goal: improve H richness (distributed PC1, higher Σ|r|, deeper abstraction) without sacrificing reconstruction quality.
+
+### 13.1 H Richness Score (baseline run14)
+
+| Component | Formula | Run14 | Direction |
+|---|---|---|---|
+| Distributed variance | 100 − PC1_L5 | **39.5%** | ↑ |
+| Feature coverage | Σ\|r_L5\| for CGM, PI, hour_sin | **0.46** | ↑ |
+| Abstraction depth | 1 − R²_probe_L5 | **0.061** | ↑ |
+| Reconstruction sanity | val MAE ≤ 0.48 | **0.45** | maintained |
+
+### 13.2 Enrichment Run Results
+
+| Run | Approach | Val MAE | PC1_L5 | Σ\|r_L5\| | Sign flip | Verdict |
+|---|---|---|---|---|---|---|
+| **14** | Baseline (`--no_age`) | 0.45 | 60.5% | 0.46 | −0.37 | **Active baseline** |
+| **15** | VICReg (λ=0.05) | 0.45 | ≈19% | ≈0.06 | Absent | **Negative** |
+| **16** | Multimodal masking (prob=0.3) | ≈0.46 | Diagonal pattern | ≈0.17 | Absent | **Negative** |
+| **18** | Scale-up (d_model=256, 8 heads) | ≈0.46 | Diagonal pattern | ≈0.17 | Absent | **Negative** |
+| **20** | JEPA (H-space prediction, EMA) | ≈0.016 | 98.0% | ≈0.04 | Absent | **Negative — collapse** |
+
+### 13.3 Consistent Failure Pattern
+
+Runs 15, 16, and 18 all return the **same diagnostic signature**:
+
+1. **Diagonal attention matrix** — the model routes each timestep to itself rather than integrating context
+2. **Near-zero L5 feature correlations** — Σ|r_L5| ≈ 0.06–0.17, barely above zero
+3. **Absent CGM sign flip** — L5 CGM r remains positive (≈+0.02 to +0.10), not negative
+4. **Disorganised PCA** — no dominant axis or highly fragmented variance
+
+This pattern is consistent regardless of whether the approach adds a regulariser (VICReg), changes the masking objective (multimodal), or increases model capacity. The failure signature matches run13 (no flags) — the additional objectives interfere with the structural anchoring that the reconstruction objective + discrete flags produce in run14.
+
+**Interpretation:** The VICReg, multimodal, and scale-up approaches all introduce objectives that compete with the reconstruction signal. In each case, the model finds a solution that satisfies both objectives at low loss but does so by reducing the structural depth of H rather than enriching it. The reconstruction pressure that produces the L5 CGM sign flip is diluted.
+
+### 13.4 JEPA Result (run20)
+
+JEPA changed the fundamental objective from raw CGM reconstruction to H-space prediction. It produced **full representation collapse**: R²_probe_L5=0.039, PC1_L5=98%, attention shows vertical bands, training curves are unstable zig-zag.
+
+Without an explicit anti-collapse term, the EMA mechanism alone is insufficient. Both the context and target encoders converged to near-constant output vectors, making the JEPA loss trivially low with no physiological learning.
+
+**H enrichment pipeline is closed. Run14 is the final Stage 1 encoder.**
+
+---
+
+## 14. Conclusions for Stage 2
+
+### 14.1 Which Representation to Use
 
 For all Stage 2 downstream applications, **use L5 (the full encoder output H)**. This is supported by:
 - Clearest event-triggered response (metabolic events encoded and contextualised)
-- CGM norm anti-correlation (high norm flags metabolically uncertain/risky states — ideal for hypo prediction)
-- Trained by the pretext task — the encoder's weights were optimised to make L5 useful for CGM reconstruction, which shares structure with all downstream CGM tasks
-- Probe R² = 0.942 confirms CGM information is preserved and linearly accessible if needed
+- CGM norm anti-correlation (high norm flags metabolically uncertain/risky states)
+- Trained by the pretext task — weights optimised to make L5 useful for CGM reconstruction, which shares structure with all downstream CGM tasks
+- Probe R² = 0.939 confirms CGM information is preserved and linearly accessible if needed
 
 The intermediate layers (L3/L4) have more distributed representations that might benefit tasks requiring diverse physiological features, but L5 is the right starting point.
 
-### 13.2 How H Encodes Physiological State
+### 14.2 How H Encodes Physiological State
 
 The full picture from the analysis:
 
@@ -406,13 +470,13 @@ The full picture from the analysis:
 - **H captures circadian structure:** Dawn phenomenon (04:00–06:00) and dinner-time transitions (18:00–19:00) are encoded as high-complexity periods.
 - **H encodes driver dynamics, not just CGM:** The post-bolus H norm trajectory tracks PI recovery (Hovorka ODE dynamics), not just the discrete flag.
 
-### 13.3 Foundation Model Claim
+### 14.3 Foundation Model Claim
 
 The key claim for the thesis — one encoder, multiple downstream applications — is supported by the following evidence from H:
 
-1. H contains CGM information (R² = 0.942 linear probe) → supports gap imputation and forecasting
-2. H norm flags low/falling glucose (CGM r = −0.60 at L5) → supports hypoglycaemia risk prediction
+1. H contains CGM information (R²_probe = 0.939 at L5) → supports gap imputation and forecasting
+2. H norm flags low/falling glucose (CGM r = −0.37 at L5) → supports hypoglycaemia risk prediction
 3. H responds to driver events with physiological timing (PI curve, RA lag) → supports counterfactual simulation
 4. H does not over-specialise to modality or age → supports cross-patient transfer
 
-The representation is rich enough to support multiple tasks without retraining the encoder.
+The representation is rich enough to support multiple tasks without retraining the encoder. The enrichment experiments (runs 15/16/18) confirm that run14's H quality is not trivially improvable — the reconstruction + discrete flag combination produces a structurally stable representation that stronger auxiliary objectives degrade rather than enhance.

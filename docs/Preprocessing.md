@@ -1,158 +1,182 @@
 
 # Preprocessing Pipeline
 
-Input: `data/interim/combined_filtered.parquet` (1575 patients, ~126M rows, 5-min resolution)
-Output: `data/processed/all/` or `data/processed/adults/` — one `.npz` per patient with windowed tensors
-
-Two processed datasets are maintained:
-- `data/processed/all/` — 1441 patients, all ages (1–80), 1.46M windows
-- `data/processed/adults/` — 988 patients, age ≥ 18, 951K windows
+**Scope:** 988 adult T1D patients (age ≥ 18). Output: one `.npz` per patient containing sliding 24h windows of a 10-feature multimodal tensor, ready for MTSM pre-training. Age is stored in the `.npz` but excluded from the encoder — see Section 7.
 
 ---
 
-## Steps
+## 1. Source Datasets
 
-### 1. Quality Filter
+### 1.1 METABONET
 
-Exclude patients where:
+Observational dataset from a European multi-centre study. Contains 831 patients with Type 1 Diabetes, spanning age 1–80. Data is provided as Parquet files (`data/raw/`) at 5-minute CGM resolution. Features available per patient: CGM, bolus insulin, basal insulin, carbohydrate intake, and insulin delivery modality (AID / SAP / MDI).
 
-- CGM std < 15 mg/dL (flat signal, sensor malfunction)
-- CGM missing > 50% (too sparse)
-- 0 carb events logged
+### 1.2 T1DEXI
 
-Optional age filter via CLI:
-- `--min-age` excludes patients below threshold
-- `--max-age` excludes patients above threshold
+Multi-site clinical dataset from the Jaeb Center for Health Research. Contains 744 patients total: 497 adults (age 18–40) and 247 pediatric patients (age 12–17). Provided as CSV files (`data/raw/`), aligned to 5-minute resolution. Same feature set as METABONET.
 
-Expected output: ~1441 patients (all), ~988 patients (adults).
+### 1.3 Integration
 
-### 2. CGM Cleaning
+The two datasets are merged into a single combined Parquet file:
 
-- Clip values outside physiological range [39, 400] mg/dL → null
-- Interpolate linearly gaps ≤ 12 consecutive steps (1h)
-- Gaps > 12 steps remain null (handled at windowing stage)
+```
+data/interim/combined_filtered.parquet
+```
 
-### 3. Driver Features
+1,575 patients total, ~126 million rows. A quality filter is then applied per patient:
 
-- Fill NaN → 0 for bolus, basal, carbs
-- Add binary flags:
-    - `bolus_logged` = 1 if bolus > 0 at that step
-    - `carbs_logged` = 1 if carbs > 0 at that step
+- CGM standard deviation ≥ 15 mg/dL (excludes flat/sensor-failure signals)
+- CGM missing data ≤ 50% (excludes patients with sparse recording)
+- At least 1 carbohydrate event logged (excludes patients with no dietary data)
+- Age ≥ 18 (adults only — fixed scope for this thesis)
 
-### 4. Hovorka Model
+After filtering: **988 adult patients** retained across both datasets.
 
-Compute continuous physiological signals from discrete events:
+---
 
-- **PI (Plasma Insulin)** — 3-compartment ODE on bolus + basal: S1 → S2 → Ifa. Parameters: VI=0.12, Ke=0.138, tmaxI=55, dt=5. Represents active insulin in plasma at each timestep.
+## 2. Physiological Feature Engineering
 
-- **RA (Rate of Absorption)** — 2-compartment ODE on carbs: D1 → D2 → RA. Parameters: tau_D=40, A_G=0.8, dt=5. Represents gut glucose absorption at each timestep.
+Raw logged events — insulin boluses and carbohydrate intake — are discrete impulses in time. A transformer operating on these raw signals cannot reason about the *current physiological state* because the effect of a bolus delivered 90 minutes ago is not visible in the raw log. To make this information explicit, we use the Hovorka (2004) compartmental model to convert discrete events into continuous physiological signals.
 
-Both computed per patient over the full time series before windowing.
+### 2.1 Plasma Insulin (PI) — Subcutaneous Absorption Model
 
-**Integration method: Euler (forward).** `scipy.integrate.odeint` was evaluated but rejected due to numerical instability on long time series (>50k timesteps) and extreme bolus values, producing NaN outputs. Euler integration with dt=5min is sufficiently accurate for these ODE parameters and produces no NaN. Validated against odeint on 10 patients — MAE of order 1e-2, visually indistinguishable signals.
+Subcutaneous insulin absorption follows a three-compartment chain: insulin enters subcutaneous depot S₁, transfers to a slower depot S₂, and then appears in plasma as active insulin I(t).
 
-### 5. Temporal Features
+$$\frac{dS_1}{dt} = u(t) - \frac{S_1(t)}{\tau_{maxI}}$$
 
-- `hour_sin` = sin(2π × hour / 24) — cyclic encoding of time of day
-- `hour_cos` = cos(2π × hour / 24)
+$$\frac{dS_2}{dt} = \frac{S_1(t)}{\tau_{maxI}} - \frac{S_2(t)}{\tau_{maxI}}$$
 
-### 6. Modality One-Hot
+$$\frac{dI}{dt} = \frac{S_2(t)}{\tau_{maxI} \cdot V_I} - K_e \cdot I(t)$$
 
-- `AID` = 1/0
-- `SAP` = 1/0
-- `MDI` = 1/0
+Where u(t) is the total insulin input (bolus + basal, mU/min) and the output I(t) is the plasma insulin concentration — the **PI** feature. Parameters:
 
-One-hot of `insulin_delivery_modality` column. Static per patient, repeated for every timestep.
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| τ_maxI | 55 min | Time to peak subcutaneous absorption |
+| V_I | 0.12 L/kg | Insulin distribution volume |
+| K_e | 0.138 min⁻¹ | Plasma elimination rate |
 
-### 6b. Age Normalisation
+### 2.2 Carbohydrate Absorption (RA) — Gut Absorption Model
 
-- `age_norm` = age / 100
+Ingested carbohydrates transit through the gut via a two-compartment chain before appearing in blood as a glucose flux.
 
-Continuous scalar, static per patient, repeated for every timestep. Not z-scored — dividing by 100 maps the observed range (1–80 years) to approximately [0, 0.8], preserving interpretability. Patients with missing age are assigned 0.0.
+$$\frac{dD_1}{dt} = A_G \cdot \text{meals}(t) - \frac{D_1(t)}{\tau_D}$$
 
-**Late fusion decision (run14+):** age_norm is stored in the .npz as feature 10 but is **dropped from the encoder input at training time** via `--no_age`. This slices the feature tensor to 10 features before the model. The motivation: passing age to the Transformer causes the encoder to use demographic shortcuts (more diagonal attention) rather than learning physiological dynamics. Age will be passed directly to Stage 2 task heads as a conditioning variable. No preprocessing changes required — the flag is applied in `experiment_mtsm.py` and `analyse_H.py`.
+$$\frac{dD_2}{dt} = \frac{D_1(t)}{\tau_D} - \frac{D_2(t)}{\tau_D}$$
 
-### 7. Normalisation
+$$RA(t) = \frac{D_2(t)}{\tau_D}$$
 
-Z-score per patient (individual, not group):
+Where meals(t) is the carbohydrate intake rate (g/min) and the output RA(t) is the rate of glucose appearance in blood — the **RA** feature. Parameters:
 
-- Compute mean and std from the patient's full time series
-- Apply to CGM, PI, RA
-- Binary features (bolus_logged, carbs_logged), one-hot (AID/SAP/MDI), hour_sin, hour_cos, and age_norm are not normalised
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| A_G | 0.8 | Carbohydrate bioavailability (dimensionless) |
+| τ_D | 40 min | Gut transit time constant |
 
-Save scaler parameters (mean, std) per patient for inverse transform at inference.
+### 2.3 Numerical Integration
 
-### 8. Sliding Windows
+Both ODEs are solved using **forward Euler at dt = 5 min** (matching CGM resolution), applied over each patient's full time series before windowing. `scipy.integrate.odeint` was evaluated and rejected: it produces NaN outputs on long time series (>50,000 timesteps) with extreme bolus spikes. Euler integration with dt = 5 min is numerically stable for these parameter values. Validated against odeint on 10 patients — MAE of order 10⁻², visually indistinguishable signals.
 
-- Window size: 288 steps (24h)
-- Stride: 72 steps (6h)
-- Discard windows with > 20% null CGM after interpolation
-- Never mix patients within a window
+### 2.4 Discrete Event Flags
 
-Output tensor shape per window: `(288, 11)`
-Features in order: `[CGM, PI, RA, hour_sin, hour_cos, bolus_logged, carbs_logged, AID, SAP, MDI, age_norm]`
+Binary indicators `bolus_logged` and `carbs_logged` are kept alongside PI and RA. The ODEs smooth the physiological response over hours, but the *precise moment* of the event — a sharp impulse at t = 0 — is erased in the smoothing. The binary flags recover this temporal anchor. This distinction matters: ablation run13 (flags removed) showed that the encoder's H representation loses its organised structure even though reconstruction MAE barely changes.
 
-### 8b. Pathological Window Filtering (at load time)
+---
 
-An additional filter is applied in `load_windows()` inside `experiment_mtsm.py` **after** loading the .npz, before training. This is separate from the patient-level quality filter in step 1.
+## 3. Signal Processing
+
+### 3.1 CGM Cleaning
+
+1. Clip values outside [39, 400] mg/dL → null (physiologically impossible readings from sensor artefacts)
+2. Interpolate null gaps of ≤ 12 consecutive steps (1 hour) linearly
+3. Gaps longer than 1 hour remain null and are handled at the windowing stage
+
+### 3.2 Temporal Encoding
+
+Time of day is encoded cyclically to preserve the continuity at midnight (23:55 and 00:05 should be adjacent):
+
+```
+hour_sin = sin(2π × hour / 24)
+hour_cos = cos(2π × hour / 24)
+```
+
+These two values together encode any time of day as a point on the unit circle, avoiding the discontinuity that would appear if raw hour (0–23) were used as a feature.
+
+### 3.3 Modality One-Hot
+
+Each patient's insulin delivery modality is encoded as a static one-hot vector across three categories: AID (automated insulin delivery), SAP (sensor-augmented pump), MDI (multiple daily injections). The vector is repeated at every timestep. This encodes the treatment context that governs the insulin dynamics pattern.
+
+---
+
+## 4. Normalisation
+
+CGM, PI, and RA are z-scored **per patient** using statistics computed from the patient's full time series:
+
+```
+x_normalised = (x − μ_patient) / σ_patient
+```
+
+The scaler parameters (μ, σ) are saved alongside the windows for inverse transform at inference time. All other features — binary flags, one-hot vectors, and hour encodings — are not normalised; they are already bounded.
+
+**Why per-patient:** T1D patients vary enormously in baseline glucose levels, insulin sensitivity, and carbohydrate absorption rates. A global normalisation would conflate this inter-patient variability with the within-patient dynamics that the model needs to learn. Per-patient z-scoring ensures the encoder sees physiological variation, not demographic differences.
+
+---
+
+## 5. Windowing
+
+Normalised per-patient time series are segmented into overlapping 24-hour windows:
+
+- **Window size:** 288 steps = 24 hours at 5-minute resolution
+- **Stride:** 72 steps = 6 hours → approximately 4 windows per day per patient
+- **Null threshold:** windows with > 20% null CGM after interpolation are discarded at extraction time
+
+### 5.1 Pathological Window Filtering
+
+A second, stricter filter is applied at training time (inside `experiment_mtsm.py`) rather than at preprocessing time, so that different training configurations can use different thresholds without reprocessing:
 
 ```python
-has_driver = ((bolus + carbs) > 0).any(axis=1)   # window has ≥1 event
+has_driver = ((bolus + carbs) > 0).any(axis=1)   # at least one logged event
 cgm_std    = cgm.std(axis=1)
 cgm_ok     = (cgm_std > 0.3) & (cgm_std < 4.0)   # not flat, not corrupted
-mask_keep  = has_driver & cgm_ok
+keep       = has_driver & cgm_ok
 ```
 
-Removes ~13.8% of windows across the adults dataset. Flat windows (no events, no glucose variability) provide no training signal; extreme-std windows are likely sensor artefacts.
-
-### 9. Serialisation
-
-Save per patient as `.npz`:
-```
-data/processed/
-├── all/
-│   ├── 1.npz
-│   ├── 2.npz
-│   ├── T_1.npz
-│   └── ...
-└── adults/
-    ├── 1.npz
-    ├── 2.npz
-    └── ...
-```
-
-Each `.npz` contains:
-
-- `windows`: array of shape `(N_windows, 288, 11)`
-- `scaler_mean`: array of shape `(3,)` — mean for CGM, PI, RA
-- `scaler_std`: array of shape `(3,)` — std for CGM, PI, RA
-- `patient_id`: str
-- `modality`: str
-- `age`: float32 — raw age in years
+This removes ~13.8% of windows across the adults dataset. Windows with no logged events provide no MTSM training signal (the masking objective requires driver context to reconstruct CGM). Windows with extreme CGM standard deviation are likely sensor artefacts.
 
 ---
 
-## Feature Tensor Summary
+## 6. Feature Tensor
 
-| Index | Feature      | Normalised | Notes                          |
-|-------|-------------|------------|-------------------------------|
-| 0     | CGM         | yes        | z-score per patient            |
-| 1     | PI          | yes        | Hovorka plasma insulin         |
-| 2     | RA          | yes        | Hovorka rate of absorption     |
-| 3     | hour_sin    | no         | already in [-1, 1]             |
-| 4     | hour_cos    | no         | already in [-1, 1]             |
-| 5     | bolus_logged| no         | binary 0/1                     |
-| 6     | carbs_logged| no         | binary 0/1                     |
-| 7     | AID         | no         | one-hot                        |
-| 8     | SAP         | no         | one-hot                        |
-| 9     | MDI         | no         | one-hot                        |
-| 10    | age_norm    | no         | age/100, static per patient    |
+The encoder receives **10 features** per timestep. Age is stored in the `.npz` as feature index 10 but is excluded from the encoder input (see note below).
+
+| Index | Feature | Normalised | Description |
+|-------|---------|------------|-------------|
+| 0 | CGM | z-score per patient | Continuous glucose monitor reading |
+| 1 | PI | z-score per patient | Plasma insulin — Hovorka 3-compartment ODE |
+| 2 | RA | z-score per patient | Carb absorption rate — Hovorka 2-compartment ODE |
+| 3 | hour_sin | — | sin(2π × hour / 24) |
+| 4 | hour_cos | — | cos(2π × hour / 24) |
+| 5 | bolus_logged | — | Binary: insulin bolus event at this step |
+| 6 | carbs_logged | — | Binary: carbohydrate event at this step |
+| 7 | AID | — | One-hot: automated insulin delivery |
+| 8 | SAP | — | One-hot: sensor-augmented pump |
+| 9 | MDI | — | One-hot: multiple daily injections |
+
+**Age exclusion:** `age_norm` (age / 100) is stored in the `.npz` as feature index 10 but is not passed to the encoder. Including age caused the transformer to exploit demographic shortcuts — attention patterns became more diagonal, meaning the model relied on patient-level identity rather than learning physiological dynamics. Age will be passed directly to Stage 2 downstream task heads as a conditioning variable (late fusion). The `.npz` always contains 11 features; the encoder input is always sliced to 10.
 
 ---
 
-## Estimated Output Size
+## 7. Output Format
 
-- all: 1441 patients × ~1014 windows = ~1.46M windows
-- adults: 988 patients × ~963 windows = ~951K windows
-- Each window: 288 × 11 × 4 bytes (float32) = 12.7 KB
-- Total all: ~18 GB uncompressed, ~6-9 GB compressed (.npz)
+One `.npz` file per patient, stored in `data/processed/adults/`:
+
+| Key | Shape | Type | Description |
+|-----|-------|------|-------------|
+| `windows` | (N, 288, 11) | float32 | All valid windows (11 features including age) |
+| `scaler_mean` | (3,) | float32 | Per-patient mean for CGM, PI, RA |
+| `scaler_std` | (3,) | float32 | Per-patient std for CGM, PI, RA |
+| `patient_id` | scalar | str | Original patient identifier |
+| `modality` | scalar | str | AID / SAP / MDI |
+| `age` | scalar | float32 | Raw age in years |
+
+**Scale:** 988 patients × ~963 windows average = ~951K windows total. Each window: 288 × 11 × 4 bytes (float32) = 12.7 KB. Total dataset: ~12 GB compressed.
