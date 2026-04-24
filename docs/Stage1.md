@@ -1,6 +1,6 @@
 # Stage 1 — MTSM Encoder
 
-**Status: Complete.** Final encoder: run21. Weights at `results/mtsm/run21/encoder_weights.weights.h5`.
+**Status: Complete.** Final encoder: run21. Weights at `results/mtsm/encoder/encoder_weights.weights.h5`.
 
 ---
 
@@ -391,7 +391,7 @@ The frozen run21 encoder receives a 24h window `(288, 10)` and produces `H ∈ R
 
 **At test time:** the pipeline is identical but without a label or gradient update. A new patient window (288, 10) → frozen encoder → H (288, 128) → trained head → prediction. The head never sees raw CGM directly; it always operates on H.
 
-**Encoder weights:** `results/mtsm/run21/encoder_weights.weights.h5`
+**Encoder weights:** `results/mtsm/encoder/encoder_weights.weights.h5`
 
 **Age conditioning:** age is not in H. Pass `age_norm` (age/100, stored in `.npz` as feature 10) directly to each Stage 2 head as a scalar conditioning input.
 

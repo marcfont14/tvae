@@ -3,7 +3,7 @@
 **Run:** run21 — 988 adult T1D patients, 70 epochs (no early stopping), `--no_age` — **final encoder**
 **Analysis scripts:** `scripts/replot.py --run_id run21 --no_age --plots all` | `scripts/attention_viz.py --run_id run21 --no_age`
 **Evaluation data:** test split only — patient-level 80/10/10 split, SEED=42, ~99 unseen patients
-**Plots location:** `results/mtsm/run21/`
+**Plots location:** `results/mtsm/encoder/`
 
 **Key metrics (active baseline):**
 

@@ -1,7 +1,7 @@
 # Stage 2 — Downstream Applications
 
 **Status: Design complete. Implementation pending.**
-**Encoder:** run21 (frozen). Weights at `results/mtsm/run21/encoder_weights.weights.h5`.
+**Encoder:** encoder (frozen). Weights at `results/mtsm/encoder/encoder_weights.weights.h5`.
 
 ---
 
@@ -114,7 +114,7 @@ H (288, 128)
   ─── Dense(64 → 1) ───            (288, 1)  →  ŷ_CGM per timestep
 ```
 
-The head weights are from `results/mtsm/run21/model_weights.weights.h5` (full model including head). No fine-tuning. Gap positions are masked in the input; the encoder fills them from context (PI, RA, visible CGM, circadian).
+The head weights are from `results/mtsm/encoder/model_weights.weights.h5` (full model including head). No fine-tuning. Gap positions are masked in the input; the encoder fills them from context (PI, RA, visible CGM, circadian).
 
 This is what the encoder was trained to do (MTSM pre-training is exactly gap filling under masking). The zero-shot case evaluates whether the training objective generalises to realistic CGM gap distributions (sensor dropout, calibration interruptions) rather than the random training masks.
 

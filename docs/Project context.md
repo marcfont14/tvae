@@ -145,7 +145,7 @@ All enrichment approaches returned one of two failure modes:
 | Individual attention visualisation | `scripts/attention_viz.py` |
 | Preprocessing | `src/preprocessing.py` |
 | Processed adults (active) | `data/processed/adults/*.npz` |
-| **Final Stage 1 encoder** | `results/mtsm/run21/encoder_weights.weights.h5` |
+| **Final Stage 1 encoder** | `results/mtsm/encoder/encoder_weights.weights.h5` |
 
 ### Container
 
