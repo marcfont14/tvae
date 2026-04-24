@@ -1061,6 +1061,150 @@ def plot_reconstruction_timeseries(model, windows_orig: np.ndarray,
     print(f"  Saved: {save_path}")
 
 
+# ── Metrics summary ───────────────────────────────────────────────────────────
+
+def save_metrics_summary(history, model, windows_orig, masks,
+                          scaler_mean, scaler_std, results_dir):
+    import json
+    from scipy.stats import pearsonr
+
+    x_masked = windows_orig.copy()
+    for i in range(len(windows_orig)):
+        x_masked[i, masks[i].astype(bool), CGM_IDX] = MASK_TOKEN
+    y_pred   = model.predict(x_masked, batch_size=BATCH_SIZE, verbose=0)
+    cgm_real = windows_orig[:, :, CGM_IDX]
+    m_bool   = masks.astype(bool)
+
+    real_z = cgm_real[m_bool]
+    pred_z = y_pred[m_bool]
+
+    sm = scaler_mean[:, np.newaxis]
+    ss = scaler_std[:, np.newaxis]
+    real_mg = (cgm_real * ss + sm)[m_bool]
+    pred_mg = (y_pred   * ss + sm)[m_bool]
+
+    mae_z    = float(np.mean(np.abs(real_z - pred_z)))
+    rmse_z   = float(np.sqrt(np.mean((real_z - pred_z) ** 2)))
+    ss_res   = np.sum((real_z - pred_z) ** 2)
+    ss_tot   = np.sum((real_z - real_z.mean()) ** 2)
+    r2       = float(1 - ss_res / ss_tot)
+    pearson_r, _ = pearsonr(real_z, pred_z)
+
+    mae_mg   = float(np.mean(np.abs(real_mg - pred_mg)))
+    rmse_mg  = float(np.sqrt(np.mean((real_mg - pred_mg) ** 2)))
+
+    tir_real = float(((real_mg >= 70) & (real_mg <= 180)).mean() * 100)
+    tir_pred = float(((pred_mg >= 70) & (pred_mg <= 180)).mean() * 100)
+    tbr_real = float((real_mg < 70).mean() * 100)
+    tbr_pred = float((pred_mg < 70).mean() * 100)
+    tar_real = float((real_mg > 180).mean() * 100)
+    tar_pred = float((pred_mg > 180).mean() * 100)
+
+    # Per-window Pearson r
+    r_vals = []
+    for i in range(len(windows_orig)):
+        m = masks[i].astype(bool)
+        yr, yp = cgm_real[i, m], y_pred[i, m]
+        if len(yr) > 3:
+            r, _ = pearsonr(yr, yp)
+            r_vals.append(float(r))
+    r_vals = np.array(r_vals)
+
+    # Driver zone MAE
+    bolus = windows_orig[:, :, BOLUS_IDX]
+    carbs = windows_orig[:, :, CARBS_IDX]
+    carbs_infl = np.zeros_like(carbs)
+    bolus_infl = np.zeros_like(bolus)
+    for offset in range(1, DRIVER_EFFECT_STEPS + 1):
+        carbs_infl[:, offset:] += (carbs[:, :-offset] > 0).astype(np.float32)
+        bolus_infl[:, offset:] += (bolus[:, :-offset] > 0).astype(np.float32)
+    carbs_infl = np.clip(carbs_infl, 0, 1)
+    bolus_infl = np.clip(bolus_infl, 0, 1)
+    abs_err    = np.abs(cgm_real - y_pred) * masks
+    pp_mask    = (carbs_infl > 0) & m_bool
+    pb_mask    = (bolus_infl > 0) & m_bool & (carbs_infl == 0)
+    bas_mask   = m_bool & (carbs_infl == 0) & (bolus_infl == 0)
+    mae_pp  = float((abs_err * pp_mask).sum()  / (pp_mask.sum()  + 1e-8))
+    mae_pb  = float((abs_err * pb_mask).sum()  / (pb_mask.sum()  + 1e-8))
+    mae_bas = float((abs_err * bas_mask).sum() / (bas_mask.sum() + 1e-8))
+
+    best_epoch    = int(np.argmin(history['val_loss'])) + 1
+    best_val_loss = float(np.min(history['val_loss']))
+    best_val_mae  = float(history['val_masked_mae'][best_epoch - 1]
+                          if 'val_masked_mae' in history
+                          else history.get('val_output_masked_mae', [0])[best_epoch - 1])
+
+    metrics = {
+        'training': {
+            'best_epoch':    best_epoch,
+            'total_epochs':  len(history['loss']),
+            'best_val_loss': best_val_loss,
+            'best_val_mae':  best_val_mae,
+        },
+        'reconstruction_zscore': {
+            'MAE':       mae_z,
+            'RMSE':      rmse_z,
+            'R2':        r2,
+            'Pearson_r': float(pearson_r),
+        },
+        'reconstruction_mgdl': {
+            'MAE':  mae_mg,
+            'RMSE': rmse_mg,
+        },
+        'per_window_pearson_r': {
+            'mean':   float(r_vals.mean()),
+            'median': float(np.median(r_vals)),
+            'std':    float(r_vals.std()),
+            'p10':    float(np.percentile(r_vals, 10)),
+            'p90':    float(np.percentile(r_vals, 90)),
+        },
+        'zone_mae_zscore': {
+            'postprandial': mae_pp,
+            'post_bolus':   mae_pb,
+            'basal':        mae_bas,
+        },
+        'glycaemic_ranges': {
+            'TIR_real': tir_real, 'TIR_pred': tir_pred,
+            'TBR_real': tbr_real, 'TBR_pred': tbr_pred,
+            'TAR_real': tar_real, 'TAR_pred': tar_pred,
+        },
+    }
+
+    path = os.path.join(results_dir, 'metrics_summary.json')
+    with open(path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+    # Print table
+    print(f"\n{'='*52}")
+    print(f"  METRICS SUMMARY")
+    print(f"{'='*52}")
+    print(f"  Training")
+    print(f"    Best epoch:      {best_epoch}  /  {len(history['loss'])}")
+    print(f"    Best val loss:   {best_val_loss:.4f}")
+    print(f"    Best val MAE:    {best_val_mae:.4f}")
+    print(f"  Reconstruction (z-score, masked spans)")
+    print(f"    MAE:             {mae_z:.4f}")
+    print(f"    RMSE:            {rmse_z:.4f}")
+    print(f"    R²:              {r2:.4f}")
+    print(f"    Pearson r:       {float(pearson_r):.4f}")
+    print(f"  Reconstruction (mg/dL)")
+    print(f"    MAE:             {mae_mg:.2f} mg/dL")
+    print(f"    RMSE:            {rmse_mg:.2f} mg/dL")
+    print(f"  Per-window Pearson r")
+    print(f"    Mean:  {r_vals.mean():.3f}   Median: {np.median(r_vals):.3f}   Std: {r_vals.std():.3f}")
+    print(f"    P10:   {np.percentile(r_vals, 10):.3f}   P90:    {np.percentile(r_vals, 90):.3f}")
+    print(f"  Zone MAE (z-score)")
+    print(f"    Postprandial:    {mae_pp:.4f}")
+    print(f"    Post-bolus:      {mae_pb:.4f}")
+    print(f"    Basal:           {mae_bas:.4f}")
+    print(f"  Glycaemic ranges (masked spans, mg/dL)")
+    print(f"    TIR  real: {tir_real:.1f}%   pred: {tir_pred:.1f}%   Δ: {tir_pred-tir_real:+.1f}%")
+    print(f"    TBR  real: {tbr_real:.1f}%   pred: {tbr_pred:.1f}%   Δ: {tbr_pred-tbr_real:+.1f}%")
+    print(f"    TAR  real: {tar_real:.1f}%   pred: {tar_pred:.1f}%   Δ: {tar_pred-tar_real:+.1f}%")
+    print(f"  Saved: {path}")
+    print(f"{'='*52}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
@@ -1338,6 +1482,10 @@ def main(args):
         pred_model, test_windows, masks_test,
         save_path=os.path.join(results_dir, 'reconstruction_timeseries.png')
     )
+
+    # 9. Metrics summary
+    save_metrics_summary(history, pred_model, test_windows, masks_test,
+                         scaler_mean_cgm, scaler_std_cgm, results_dir)
 
     print(f"\n{'='*52}")
     print(f"  Done. Results in: {results_dir}/")

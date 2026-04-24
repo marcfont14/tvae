@@ -44,7 +44,7 @@ def load_cgm(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, encoding='latin-1',
                      usecols=['USUBJID', 'LBTESTCD', 'LBSTRESN', 'LBDTC'])
     df = df[df['LBTESTCD'] == 'GLUC'].copy()
-    df['date'] = pd.to_datetime(df['LBDTC'], format='mixed')
+    df['date'] = pd.to_datetime(df['LBDTC'], infer_datetime_format=True)
     df['CGM'] = pd.to_numeric(df['LBSTRESN'], errors='coerce')
     df = df.rename(columns={'USUBJID': 'id'})[['id', 'date', 'CGM']]
     return df
@@ -55,7 +55,7 @@ def load_insulin(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, encoding='latin-1',
                      usecols=['USUBJID', 'FATESTCD', 'FASTRESN', 'FADTC',
                                'FADUR', 'INSSTYPE', 'INSNMBOL', 'INSEXBOL'])
-    df['date'] = pd.to_datetime(df['FADTC'], format='mixed')
+    df['date'] = pd.to_datetime(df['FADTC'], infer_datetime_format=True)
     df['dose'] = pd.to_numeric(df['FASTRESN'], errors='coerce')
     df['duration'] = pd.to_timedelta(df['FADUR'], errors='coerce')
     df = df.rename(columns={'USUBJID': 'id'})
@@ -138,7 +138,7 @@ def load_carbs(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, encoding='latin-1',
                      usecols=['USUBJID', 'MLDTC', 'MLDOSE', 'MLDOSU'])
     df = df[df['MLDOSU'] == 'g'].copy()   # keep only gram entries
-    df['date'] = pd.to_datetime(df['MLDTC'], format='mixed')
+    df['date'] = pd.to_datetime(df['MLDTC'], infer_datetime_format=True)
     df['carbs'] = pd.to_numeric(df['MLDOSE'], errors='coerce')
     df = df.rename(columns={'USUBJID': 'id'})[['id', 'date', 'carbs']]
     # Aggregate multiple food items at same timestamp

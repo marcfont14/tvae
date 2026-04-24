@@ -1,5 +1,7 @@
 pandas
 pyarrow
+polars
+tqdm
 numpy
 matplotlib
 seaborn

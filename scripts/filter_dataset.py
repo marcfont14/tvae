@@ -93,6 +93,8 @@ def write_filtered(input_path, output_path, valid_ids):
     if missing:
         print(f"  Warning: columns not found and skipped: {missing}")
 
+    target_schema = None
+
     for batch in f.iter_batches(columns=keep, batch_size=BATCH_SIZE):
         table = batch.to_pydict()
         # Filter rows
@@ -104,9 +106,18 @@ def write_filtered(input_path, output_path, valid_ids):
         filtered = {col: [vals[i] for i in mask] for col, vals in table.items()}
         out_table = pa.table(filtered)
 
-        if writer is None:
-            writer = pq.ParquetWriter(output_path, out_table.schema)
+        if target_schema is None:
+            # Cast null-typed columns to double so schema is consistent
+            fields = []
+            for field in out_table.schema:
+                if pa.types.is_null(field.type):
+                    fields.append(field.with_type(pa.float64()))
+                else:
+                    fields.append(field)
+            target_schema = pa.schema(fields)
+            writer = pq.ParquetWriter(output_path, target_schema)
 
+        out_table = out_table.cast(target_schema)
         writer.write_table(out_table)
         rows_written += len(mask)
         print(f"  Rows written so far: {rows_written:,}", end='\r')
