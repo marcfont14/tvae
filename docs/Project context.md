@@ -1,6 +1,6 @@
 # Glucose Foundation Model — Project Context
 
-**Undergraduate Thesis in Biomedical Engineering** — _Last updated: 2026-04-10_
+**Undergraduate Thesis in Biomedical Engineering** — _Last updated: 2026-04-27_
 
 ---
 
@@ -111,7 +111,8 @@ The Stage 1 encoder is **frozen**. Each application adds a lightweight task-spec
 | **12** | 2-layer MLP head, adults only, 70 epochs | **Val MAE=0.46. Best Stage 1. CGM sign flip −0.60 at L5.** |
 | 13 | `--no_logged_events` ablation | Val MAE=0.47. Sign flip absent. Discrete flags are critical. |
 | **14** | `--no_age` | Val MAE=0.45. PC1_L5=60.5%, Σ\|r\|≈0.46, R²=0.939. encoder_weights only. |
-| **21** | Identical to run14, full weights saved | **Val MAE≈0.45. R²=0.944. Individual attention confirmed. FINAL ENCODER.** |
+| **21** | Identical to run14, full weights saved | **Val MAE≈0.45. R²=0.944. Individual attention confirmed.** |
+| **encoder** | Retrained on 1037 patients (METABONET train+test + T1DEXI adults), --no_age | **Val MAE=0.40, probe R²=0.927. CGM_r=+0.07 (no sign flip). ACTIVE.** |
 | 15 | `--vicreg_lambda 0.05` | Σ\|r\|≈0.06, sign flip absent. **Negative.** |
 | 16 | `--multimodal_prob 0.3` | Diagonal attention, Σ\|r\|≈0.17, sign flip gone. **Negative.** |
 | 17 | `--contrastive_lambda 0.1` | Custom training loop incompatible with TF XLA on CC 12.0. **Skipped.** |
@@ -188,21 +189,23 @@ python -u scripts/experiment_mtsm.py ... | tee results/mtsm/runXX_log.txt
 
 - Full preprocessing pipeline (Hovorka PI/RA, per-patient .npz, adults only)
 - MTSM training with driver-weighted loss, span masking, diagnostic plots
-- Stage 1 complete — run14 final encoder (val MAE=0.45, R²=0.939)
+- Stage 1 complete — final encoder retrained on 1037 patients (val MAE=0.40, probe R²=0.927)
 - Ablations: flags critical (run13), age late fusion (run14)
 - H enrichment pipeline complete — runs 15/16/17/18/20, all negative, pipeline closed
-- Stage 2 fully designed — `docs/stage_2_proposals.md`
+- Stage 2 fully designed — `docs/Stage2.md`
+- App 1 (Gap Imputation) — done, zero-shot
 - Documentation: `docs/Preprocessing.md`, `docs/Stage1.md`, `docs/H_analysis.md` up to date
 
 ### In progress 🔄
 
-- Stage 2 implementation
+- App 2 (Forecasting): run01 running — 4 variants (FM/TS × Transformer/LSTM), 50 epochs, 988 patients
 
 ### Next 📋
 
-- Stage 2: App 2 (Forecasting) + App 1 (Hypo Survival) first
-- App 4 (Gap Imputation) — zero-shot, essentially free
-- App 3 (ISF/CR Profiling) after
+- App 3 (Hypo Risk, Weibull survival)
+- App 4 (ISF/CR Profiling)
+- App 5 (Digital Twin, CVAE)
+- App 6 (TIR Prediction, optional)
 
 ### Thesis writing 📝
 

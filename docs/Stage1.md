@@ -1,6 +1,6 @@
 # Stage 1 — MTSM Encoder
 
-**Status: Complete.** Final encoder: run21. Weights at `results/mtsm/encoder/encoder_weights.weights.h5`.
+**Status: Complete.** Final encoder: retrained on 1037 patients (METABONET train+test + T1DEXI adults). Weights at `results/mtsm/encoder/encoder_weights.weights.h5`.
 
 ---
 

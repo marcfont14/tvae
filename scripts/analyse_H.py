@@ -29,6 +29,10 @@ from tensorflow.keras import layers
 from scipy.stats import pearsonr
 from sklearn.linear_model import Ridge
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.encoder import load_encoder
+
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
@@ -121,18 +125,18 @@ def build_layer_models(encoder, n_layers=N_LAYERS):
 
 
 def _get_attention_single(encoder, window_np, layer_idx, d_model=D_MODEL):
-    """Compute attention weights for one window at a given layer. Returns (n_heads, T, T)."""
+    """Compute attention weights for one window at a given layer. Returns (n_heads, 288, 288)."""
     batch = tf.cast(window_np[np.newaxis], tf.float32)
     mha_layer = encoder.get_layer(f'mhsa_{layer_idx}')
     if layer_idx == 0:
-        proj_model = keras.Model(encoder.input, encoder.get_layer('input_proj').output)
-        pe = get_positional_encoding(WINDOW_LEN, d_model).numpy()
-        q  = tf.cast(proj_model(batch, training=False).numpy() + pe, tf.float32)
+        # Input to block 0 = CLS token prepended to projected+PE sequence
+        cls_model = keras.Model(encoder.input, encoder.get_layer('cls_token').output)
+        q = tf.cast(cls_model(batch, training=False), tf.float32)  # (1, 289, d)
     else:
         prev_model = keras.Model(encoder.input, encoder.get_layer(f'norm2_{layer_idx-1}').output)
-        q = tf.cast(prev_model(batch, training=False).numpy(), tf.float32)
+        q = tf.cast(prev_model(batch, training=False), tf.float32)  # (1, 289, d)
     _, attn = mha_layer(q, q, return_attention_scores=True, training=False)
-    return attn.numpy()[0]   # (n_heads, T, T)
+    return attn.numpy()[0, :, 1:, 1:]   # (n_heads, 288, 288) — drop CLS row/col
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -202,7 +206,7 @@ def compute_H_per_layer(encoder, windows, n_layers=N_LAYERS, batch_size=64):
         )
         for start in range(0, len(windows), batch_size):
             batch = tf.cast(windows[start:start + batch_size], tf.float32)
-            H_layers[i].append(layer_model(batch, training=False).numpy())
+            H_layers[i].append(layer_model(batch, training=False).numpy()[:, 1:, :])  # drop CLS
     return [np.concatenate(h, axis=0) for h in H_layers]
 
 
@@ -483,7 +487,7 @@ def plot_H_norm_vs_drivers(encoder, windows, results_dir):
     print("  [7/8] Event-triggered H norm at L5...")
     H_L5  = keras.Model(encoder.input, encoder.get_layer('norm2_4').output)(
         tf.cast(windows, tf.float32), training=False
-    ).numpy()
+    ).numpy()[:, 1:, :]  # drop CLS
     norms = np.linalg.norm(H_L5, axis=-1)
 
     bolus_mask = windows[:, :, BOLUS_IDX] > 0
@@ -573,7 +577,7 @@ def plot_abstraction_trajectory(encoder, windows, n_layers, results_dir):
     for i in range(n_layers):
         H = keras.Model(encoder.input, encoder.get_layer(f'norm2_{i}').output)(
             tf.cast(windows, tf.float32), training=False
-        ).numpy()
+        ).numpy()[:, 1:, :]  # drop CLS
         h_pool = H.mean(axis=1)
         pc1s.append(PCA(n_components=1).fit(h_pool).explained_variance_ratio_[0] * 100)
 
@@ -669,10 +673,9 @@ def main(args):
 
     print(f"\n── analyse_H.py  run={args.run_id} ──────────────────────────────")
 
-    # Build + load encoder
-    encoder = build_transformer_encoder(n_features=n_features)
-    encoder(tf.zeros((1, WINDOW_LEN, n_features)), training=False)
-    encoder.load_weights(enc_path)
+    # Build + load encoder (encoder2: CLS token architecture)
+    encoder = load_encoder(weights_path=enc_path, trainable=False,
+                           n_features=n_features)
     print(f"  Encoder loaded: {enc_path}")
 
     # Load test windows

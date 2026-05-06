@@ -321,6 +321,9 @@ def extract_windows(df: pl.DataFrame, cfg: Settings) -> np.ndarray:
             continue
         # Replace remaining nulls with 0 (post-interpolation residuals)
         window = np.nan_to_num(window, nan=0.0)
+        # Discard windows with sensor noise: >5% of 5-min steps exceed 1.5σ change
+        if (np.abs(np.diff(window[:, 0])) > 1.5).mean() > 0.05:
+            continue
         windows.append(window)
 
     if len(windows) == 0:

@@ -25,7 +25,7 @@ The thesis claim is FM ≥ TS, with the performance gap widening as labelled dat
 | #   | Application                  | Priority     | H format          | Type          | Est. time |
 | --- | ---------------------------- | ------------ | ----------------- | ------------- | --------- |
 | 1   | Gap Imputation               | Already done | Full H (288, 128) | Deterministic | 1–2 days  |
-| 2   | Short-Horizon Forecasting    | High         | Full H (288, 128) | Deterministic | 1–2 weeks |
+| 2   | Short-Horizon Forecasting (30 min) | High    | Full H (288, 128) | Deterministic | 1–2 weeks |
 | 3   | Overnight Hypoglycaemia Risk | High         | Pooled h (128,)   | Probabilistic | 1 week    |
 | 4   | Dynamic ISF/CR Profiling     | Medium       | Pooled h (128,)   | Deterministic | 2 weeks   |
 | 5   | Digital Twin + LoRA          | Medium       | Full H (288, 128) | Generative    | 3–4 weeks |
@@ -129,53 +129,58 @@ This is what the encoder was trained to do (MTSM pre-training is exactly gap fil
 
 ---
 
-## 5. Application 2 — Short-Horizon Forecasting (2–4h)
+## 5. Application 2 — Short-Horizon Forecasting (30 min)
 
-**Type:** Deterministic | **Est. time:** 1–2 weeks  
-**Encoder integration:** H (288, 128) serves as K/V in a cross-attention decoder; future planned drivers are projected to Q  
+**Type:** Deterministic | **Status:** run01 in progress  
+**Encoder integration:** 4 variants — FM/TS × Transformer/LSTM decoder  
 
 **Priority:** High.
 
 ### Input
 - **History:** full H (288, 128) — the encoder output for the current 24h window
-- **Future drivers:** planned PI/RA/event features at forecast horizons (t+30, t+60, t+120 min)
-- We predict 3 values for easier comparison with baseline 
+- **No future drivers** — driverless forecast; encoder context alone drives prediction
+- Output: 6 CGM values at t+5, t+10, t+15, t+20, t+25, t+30 min
 
-### Architecture
-Cross-attention decoder: H serves as keys and values (what the encoder knows); future planned drivers serve as queries (what the decoder is asking about).
+### Architecture — Transformer Decoder (primary)
 
 ```
-Planned future drivers at [t+30, t+60, t+120]:
-  ─── Dense(n_driver_features → 128) ───   Q: (3, 128)
+6 learned horizon query embeddings: Q ∈ R^(6, 128)
 
-H (288, 128)                               K: (288, 128)
-                                           V: (288, 128)
+H (288, 128)                               K: (288, 128), V: (288, 128)
 
 Cross-attention:
-  scores = softmax( Q · K^T / √128 )       (3, 288)
-  context = scores · V                     (3, 128)
+  scores = softmax( Q · K^T / √128 )       (6, 288)
+  context = scores · V                     (6, 128)
 
   ─── Dense(128 → 64, ReLU) ───
-  ─── Dense(64 → 1) ───                    ŷ_CGM at t+30, t+60, t+120   (3,)
+  ─── Dense(64 → 1) ───                    ŷ_CGM at t+5…t+30   (6,)
 ```
 
-**Future driver modes:**
-- **Oracle:** true future PI/RA read from the dataset (upper bound, not deployable)
-- **Planned:** user-specified meal/bolus plan → Hovorka ODE → planned PI/RA (deployable)
+### Architecture — LSTM Decoder (secondary)
 
-The cross-attention decoder lets the model selectively read the parts of H most relevant to each forecast horizon, conditioned on what the planned drivers suggest will happen.
+```
+H (288, 128)
+  ─── Learnable attention pooling ───      h (128,)
+  h → LSTM initial hidden state
+  LSTM unrolled 6 steps                    ŷ_CGM at t+5…t+30   (6,)
+```
 
-**Loss:** Huber(δ=1.0), which downweights large outliers relative to MSE.
-**Stride:** 12h for Stage 2 (vs 6h in Stage 1) to reduce the 75% window overlap.
+**Loss:** Huber(δ=1.0).
 
-### Label Pipeline
-Read raw CGM at absolute timestamps t+30, t+60, t+120 from the raw patient time series (outside the training window). Apply per-patient inverse z-score transform → compare in mg/dL.
+### Variants (4 total)
+
+| Variant | Encoder init | Decoder |
+|---|---|---|
+| FM-Transformer | Frozen (pre-trained) | Transformer |
+| TS-Transformer | Random init | Transformer |
+| FM-LSTM | Frozen (pre-trained) | LSTM |
+| TS-LSTM | Random init | LSTM |
 
 ### Evaluation
 | Metric | Horizons |
 |---|---|
-| RMSE / MAE | 30 min, 60 min, 120 min |
-| Clarke Error Grid | 30 min, 60 min, 120 min |
+| RMSE / MAE | t+5, t+10, t+15, t+20, t+25, t+30 min |
+| Clarke Error Grid | t+30 min (primary clinical horizon) |
 
 **Baselines:** GluFormer (Nature 2025), CGMformer (Nat Sci Rev 2025).
 

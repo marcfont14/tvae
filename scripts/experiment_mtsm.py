@@ -71,6 +71,12 @@ import matplotlib.gridspec as gridspec
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+class CLSToken(layers.Layer):
+    """Prepend a learned CLS token: (B, T, d) → (B, T+1, d)."""
+    def build(self, input_shape):
+        self.cls = self.add_weight(shape=(1, 1, input_shape[-1]), name='cls_token')
+    def call(self, x):
+        return tf.concat([tf.tile(self.cls, [tf.shape(x)[0], 1, 1]), x], axis=1)
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
@@ -88,9 +94,10 @@ CARBS_IDX   = 6        # feature 6 = carbs_logged
 
 # Masking defaults
 MASK_RATIO   = 0.35
-MASK_MIN_LEN = 60       
-MASK_MAX_LEN = 96       
+MASK_MIN_LEN = 60
+MASK_MAX_LEN = 96
 MASK_TOKEN   = 0.0
+CAUSAL_TAIL  = 6    # last N CGM steps always masked → prediction aux loss
 
 # Transformer
 D_MODEL  = 128
@@ -149,6 +156,7 @@ def build_transformer_encoder(window_len, n_features, d_model, n_heads,
     x   = layers.Dense(d_model, name='input_proj')(inp)
     pe  = get_positional_encoding(window_len, d_model)
     x   = x + pe
+    x   = CLSToken(name='cls_token')(x)   # (B, window_len+1, d_model)
 
     for i in range(n_layers):
         attn = layers.MultiHeadAttention(
@@ -164,7 +172,9 @@ def build_transformer_encoder(window_len, n_features, d_model, n_heads,
         ffn = layers.Dropout(dropout)(ffn)
         x   = layers.LayerNormalization(epsilon=1e-6, name=f'norm2_{i}')(x + ffn)
 
-    return keras.Model(inp, x, name='TransformerEncoder')
+    H     = layers.Lambda(lambda z: z[:, 1:, :], name='H')(x)      # (B, window_len, d_model)
+    h_cls = layers.Lambda(lambda z: z[:, 0, :],  name='h_cls')(x)  # (B, d_model)
+    return keras.Model(inp, [H, h_cls], name='TransformerEncoder')
 
 
 # ── MTSM Model ────────────────────────────────────────────────────────────────
@@ -175,19 +185,18 @@ def build_mtsm_model(window_len, n_features, d_model, n_heads, n_layers,
     encoder = build_transformer_encoder(
         window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout
     )
-    H   = encoder(inp)
-    out = layers.Dense(64, activation='relu', name='recon_hidden')(H)  # (batch, 288, 64)
-    out = layers.Dense(1, name='reconstruction_head')(out)             # (batch, 288, 1)
-    out = layers.Reshape((window_len,), name='output')(out)            # (batch, 288)
+    H, h_cls = encoder(inp)
 
-    if vicreg_lambda > 0.0:
-        # Expose mean-pooled H as a second output for VICReg loss.
-        # GlobalAveragePooling1D = mean over time axis — equivalent to reduce_mean(H, axis=1).
-        # Use a proper Keras layer (not Lambda) to guarantee GPU graph compilation.
-        h_pool = layers.GlobalAveragePooling1D(name='h_pool')(H)
-        return keras.Model(inp, [out, h_pool], name='MTSM'), encoder
+    # Reconstruction head: full sequence → masked span MSE
+    recon = layers.Dense(64, activation='relu', name='recon_hidden')(H)
+    recon = layers.Dense(1,  name='reconstruction_head')(recon)
+    recon = layers.Reshape((window_len,), name='recon_output')(recon)
 
-    return keras.Model(inp, out, name='MTSM'), encoder
+    # Causal prediction head: h_cls → last CAUSAL_TAIL CGM z-scores
+    pred = layers.Dense(64, activation='relu', name='pred_hidden')(h_cls)
+    pred = layers.Dense(CAUSAL_TAIL, name='pred_output')(pred)
+
+    return keras.Model(inp, [recon, pred], name='MTSM'), encoder
 
 
 # ── Masking ───────────────────────────────────────────────────────────────────
@@ -405,8 +414,12 @@ def apply_masks_vectorized(wins: np.ndarray, mask_ratio: float,
     if no_age:
         x_masked = x_masked[:, :, :10]
 
+    # Causal prediction target: last CAUSAL_TAIL CGM z-scores, always masked in input
+    last_6 = wins[:, -CAUSAL_TAIL:, CGM_IDX].copy()       # (N, CAUSAL_TAIL) from original
+    x_masked[:, -CAUSAL_TAIL:, CGM_IDX] = MASK_TOKEN      # zero out tail
+
     Y = np.stack([targets, masks, driver_weight], axis=-1)  # (N, 288, 3)
-    return x_masked.astype(np.float32), Y
+    return x_masked.astype(np.float32), Y, last_6.astype(np.float32)
 
 
 def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
@@ -443,7 +456,7 @@ def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
             except Exception as e:
                 print(f'[WARN] skipping {fpath}: {e}', flush=True)
                 continue
-            x_masked, Y = apply_masks_vectorized(
+            x_masked, Y, last_6 = apply_masks_vectorized(
                 wins, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
                 no_logged_events=no_logged_events, no_age=no_age
             )
@@ -451,14 +464,18 @@ def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
                 perm     = np.random.permutation(len(wins))
                 x_masked = x_masked[perm]
                 Y        = Y[perm]
-            yield x_masked, Y  # (N_patient_windows, 288, 11/3)
+                last_6   = last_6[perm]
+            yield x_masked, (Y, last_6)
 
     n_features_out = 10 if no_age else N_FEATURES
     ds = tf.data.Dataset.from_generator(
         generator,
         output_signature=(
             tf.TensorSpec(shape=(None, WINDOW_LEN, n_features_out), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, WINDOW_LEN, 3),              dtype=tf.float32),
+            (
+                tf.TensorSpec(shape=(None, WINDOW_LEN, 3), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, CAUSAL_TAIL),   dtype=tf.float32),
+            ),
         )
     )
     ds = ds.unbatch()
@@ -499,11 +516,11 @@ def make_paired_window_dataset(index: list, shuffle: bool, mask_ratio: float,
             anchors   = wins[:-1]
             positives = wins[1:]
 
-            x_a, Y_a = apply_masks_vectorized(
+            x_a, Y_a, _ = apply_masks_vectorized(
                 anchors, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
                 no_logged_events=no_logged_events, no_age=no_age
             )
-            x_p, _   = apply_masks_vectorized(
+            x_p, _, _   = apply_masks_vectorized(
                 positives, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
                 no_logged_events=no_logged_events, no_age=no_age
             )
@@ -536,8 +553,12 @@ def plot_training_curves(history, save_path: str):
     fig.suptitle('MTSM Training Curves — Masked Reconstruction',
                  fontsize=14, fontweight='bold')
 
-    # Multi-output models (VICReg) name the metric 'output_masked_mae'
-    mae_key = 'output_masked_mae' if 'output_masked_mae' in history else 'masked_mae'
+    if 'recon_output_masked_mae' in history:
+        mae_key = 'recon_output_masked_mae'
+    elif 'output_masked_mae' in history:
+        mae_key = 'output_masked_mae'
+    else:
+        mae_key = 'masked_mae'
 
     for ax, (metric, label) in zip(axes, [('loss', 'Masked MSE Loss (+ shape)'),
                                            (mae_key, 'Masked MAE')]):
@@ -1130,9 +1151,12 @@ def save_metrics_summary(history, model, windows_orig, masks,
 
     best_epoch    = int(np.argmin(history['val_loss'])) + 1
     best_val_loss = float(np.min(history['val_loss']))
-    best_val_mae  = float(history['val_masked_mae'][best_epoch - 1]
-                          if 'val_masked_mae' in history
-                          else history.get('val_output_masked_mae', [0])[best_epoch - 1])
+    for _mae_key in ('val_masked_mae', 'val_recon_output_masked_mae', 'val_output_masked_mae'):
+        if _mae_key in history:
+            best_val_mae = float(history[_mae_key][best_epoch - 1])
+            break
+    else:
+        best_val_mae = 0.0
 
     metrics = {
         'training': {
@@ -1205,6 +1229,63 @@ def save_metrics_summary(history, model, windows_orig, masks,
     print(f"{'='*52}")
 
 
+# ── TIR linear probe ─────────────────────────────────────────────────────────
+
+def tir_probe(encoder, test_windows, scaler_means, scaler_stds, results_dir):
+    """
+    Probe: Ridge(h_cls → TIR%) vs. random-init baseline.
+    R² delta directly measures how much MTSM pre-training enriches h_cls.
+    """
+    import json
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import train_test_split
+
+    print("\n  TIR linear probe (h_cls → TIR%) ...")
+
+    cgm_z  = test_windows[:, :, CGM_IDX]
+    cgm_mg = cgm_z * scaler_stds[:, None] + scaler_means[:, None]
+    tir    = ((cgm_mg >= 70) & (cgm_mg <= 180)).mean(axis=1) * 100  # (N,)
+
+    # h_cls from trained encoder
+    h_cls = encoder.predict(test_windows, batch_size=BATCH_SIZE, verbose=0)[1]  # (N, D_MODEL)
+
+    # h_cls from random-init encoder — baseline, expect R² ≈ 0
+    n_feat   = test_windows.shape[2]
+    enc_rand = build_transformer_encoder(
+        WINDOW_LEN, n_feat, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
+    )
+    enc_rand(tf.zeros((1, WINDOW_LEN, n_feat)))
+    h_rand = enc_rand.predict(test_windows, batch_size=BATCH_SIZE, verbose=0)[1]
+
+    idx    = np.arange(len(tir))
+    tr, te = train_test_split(idx, test_size=0.3, random_state=42)
+
+    def _r2(X):
+        m = Ridge(alpha=1.0)
+        m.fit(X[tr], tir[tr])
+        return float(m.score(X[te], tir[te]))
+
+    r2_trained = _r2(h_cls)
+    r2_rand    = _r2(h_rand)
+
+    print(f"  R²  trained={r2_trained:.3f}   random={r2_rand:.3f}   "
+          f"delta={r2_trained - r2_rand:+.3f}")
+
+    summary_path = os.path.join(results_dir, 'metrics_summary.json')
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            summary = json.load(f)
+    else:
+        summary = {}
+    summary['tir_probe'] = {
+        'r2_trained': r2_trained,
+        'r2_random':  r2_rand,
+        'delta':      round(r2_trained - r2_rand, 4),
+    }
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
@@ -1215,6 +1296,12 @@ def main(args):
     D_MODEL = args.d_model
     N_HEADS = args.n_heads
     D_FF    = args.d_ff
+
+    if args.vicreg_lambda > 0.0 or args.contrastive_lambda > 0.0:
+        raise NotImplementedError(
+            "VICReg and contrastive paths are not updated for the CLS encoder. "
+            "Use the default training path (no --vicreg_lambda / --contrastive_lambda)."
+        )
 
     run_id      = args.run_id if args.run_id else datetime.now().strftime('%Y%m%d_%H%M')
     results_dir = os.path.join(RESULTS_BASE, run_id)
@@ -1266,54 +1353,21 @@ def main(args):
         no_logged_events=args.no_logged_events, no_age=args.no_age
     )
 
-    if contrastive:
-        # Paired dataset for InfoNCE — yields ((x_anchor, x_positive), Y_anchor)
-        train_ds = make_paired_window_dataset(train_index, shuffle=True,  **ds_kwargs)
-        val_ds   = make_paired_window_dataset(val_index,   shuffle=False, **ds_kwargs)
-    else:
-        train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
-        val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
+    train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
+    val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
 
     # 4. Build model
     n_features_model = 10 if args.no_age else N_FEATURES
     model, encoder = build_mtsm_model(
-        WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT,
-        vicreg_lambda=args.vicreg_lambda
+        WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
     )
 
-    # Cache head layers for contrastive training loop (avoids sub-model retracing)
-    if args.contrastive_lambda > 0.0:
-        _recon_hidden = model.get_layer('recon_hidden')
-        _recon_out    = model.get_layer('reconstruction_head')
-        _recon_shape  = model.get_layer('output')
-
-    if vicreg:
-        # Multi-output model: add dummy zero target for h_pool output
-        def add_vicreg_dummy(x, y):
-            batch_size = tf.shape(x)[0]
-            return x, (y, tf.zeros((batch_size, D_MODEL)))
-        train_ds = train_ds.map(add_vicreg_dummy)
-        val_ds   = val_ds.map(add_vicreg_dummy)
-        model.compile(
-            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
-            loss=[MaskedMSELoss(shape_loss_lambda=args.shape_loss), VICRegLoss()],
-            loss_weights=[1.0, args.vicreg_lambda],
-            metrics={'output': MaskedMAE()}
-        )
-    elif contrastive:
-        # Paired inputs: model sees x_anchor only for reconstruction.
-        # InfoNCE computed manually in a custom train loop via GradientTape.
-        model.compile(
-            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
-            loss=MaskedMSELoss(shape_loss_lambda=args.shape_loss),
-            metrics=[MaskedMAE()]
-        )
-    else:
-        model.compile(
-            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
-            loss=MaskedMSELoss(shape_loss_lambda=args.shape_loss),
-            metrics=[MaskedMAE()]
-        )
+    model.compile(
+        optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+        loss=[MaskedMSELoss(shape_loss_lambda=args.shape_loss), keras.losses.Huber()],
+        loss_weights=[1.0, 0.25],
+        metrics={'recon_output': [MaskedMAE()]}
+    )
 
     model.summary()
 
@@ -1329,98 +1383,22 @@ def main(args):
         ),
     ]
 
-    if contrastive:
-        # Custom training loop: MTSM loss + InfoNCE on mean-pooled H pairs
-        infonce      = InfoNCELoss(temperature=0.1)
-        optimizer    = keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4)
-        mtsm_loss_fn = MaskedMSELoss(shape_loss_lambda=args.shape_loss)
-        mae_metric   = MaskedMAE()
-        history = {'loss': [], 'masked_mae': [], 'val_loss': [], 'val_masked_mae': []}
+    steps_per_epoch = len(train_index) // BATCH_SIZE
+    history_obj = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch,
+        callbacks=callbacks,
+        verbose=1
+    )
+    history = history_obj.history
 
-        best_val_loss  = float('inf')
-        patience_count = 0
-        best_weights   = None
-
-        contrastive_lambda_tf = tf.constant(args.contrastive_lambda, dtype=tf.float32)
-
-        def train_step(x_a, x_p, y_a):
-            with tf.GradientTape() as tape:
-                H_a       = encoder(x_a, training=True)
-                recon_a   = _recon_shape(_recon_out(_recon_hidden(H_a, training=True), training=True), training=True)
-                loss_mtsm = mtsm_loss_fn(y_a, recon_a)
-                H_p       = encoder(x_p, training=True)
-                h_a       = tf.reduce_mean(H_a, axis=1)
-                h_p       = tf.reduce_mean(H_p, axis=1)
-                loss_info = infonce(h_a, h_p)
-                loss      = loss_mtsm + contrastive_lambda_tf * loss_info
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            return loss_mtsm, recon_a
-
-        for epoch in range(args.epochs):
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
-            # ── Training ────────────────────────────────────────────────────
-            train_loss_sum, train_steps = 0.0, 0
-            mae_metric.reset_state()
-            for (x_a, x_p), y_a in train_ds:
-                loss_mtsm, recon_a = train_step(x_a, x_p, y_a)
-                mae_metric.update_state(y_a, recon_a)
-                train_loss_sum += float(loss_mtsm); train_steps += 1
-            history['loss'].append(train_loss_sum / train_steps)
-            history['masked_mae'].append(float(mae_metric.result()))
-
-            # ── Validation ──────────────────────────────────────────────────
-            val_loss_sum, val_steps = 0.0, 0
-            mae_metric.reset_state()
-            for (x_a, x_p), y_a in val_ds:
-                recon_a = model(x_a, training=False)
-                val_loss_sum += float(mtsm_loss_fn(y_a, recon_a)); val_steps += 1
-                mae_metric.update_state(y_a, recon_a)
-            val_loss = val_loss_sum / val_steps
-            history['val_loss'].append(val_loss)
-            history['val_masked_mae'].append(float(mae_metric.result()))
-
-            print(f"  loss={history['loss'][-1]:.4f}  mae={history['masked_mae'][-1]:.4f}"
-                  f"  val_loss={val_loss:.4f}  val_mae={history['val_masked_mae'][-1]:.4f}")
-
-            # Manual early stopping + LR reduction
-            if val_loss < best_val_loss - 1e-4:
-                best_val_loss  = val_loss
-                patience_count = 0
-                best_weights   = model.get_weights()
-            else:
-                patience_count += 1
-                if patience_count >= 5:
-                    new_lr = max(float(optimizer.learning_rate) * 0.5, 1e-6)
-                    optimizer.learning_rate.assign(new_lr)
-                    print(f"  LR reduced to {new_lr:.2e}")
-                    patience_count = 0
-                if patience_count >= 10:
-                    print(f"  Early stopping at epoch {epoch+1}")
-                    break
-
-        if best_weights is not None:
-            model.set_weights(best_weights)
-    else:
-        steps_per_epoch = len(train_index) // BATCH_SIZE
-        history_obj = model.fit(
-            train_ds,
-            validation_data=val_ds,
-            epochs=args.epochs,
-            steps_per_epoch=steps_per_epoch,
-            callbacks=callbacks,
-            verbose=1
-        )
-        history = history_obj.history
-
-    # 6. Save weights — encoder (for Stage 2) + full model (for replotting)
+    # 6. Save weights — encoder (for Stage 2) + reconstruction head (for replotting)
     encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
     encoder.save_weights(encoder_path)
     model_path = os.path.join(results_dir, 'model_weights.weights.h5')
-    if vicreg:
-        pred_model_to_save = keras.Model(model.input, model.output[0])
-    else:
-        pred_model_to_save = model
+    pred_model_to_save = keras.Model(model.input, model.output[0], name='MTSM_recon')
     pred_model_to_save.save_weights(model_path)
     print(f"\n  Encoder weights saved: {encoder_path}")
     print(f"  Full model weights saved: {model_path}")
@@ -1439,11 +1417,8 @@ def main(args):
     if args.no_age:
         test_windows = test_windows[:, :, :10]
 
-    # For VICReg multi-output model, build a single-output pred_model for plots
-    if vicreg:
-        pred_model = keras.Model(model.input, model.output[0])
-    else:
-        pred_model = model
+    # Build single-output model (recon head only) for plots and metrics
+    pred_model = keras.Model(model.input, model.output[0], name='MTSM_recon')
 
     # 8. Plots
     print(f"\n{'='*52}")
@@ -1483,9 +1458,10 @@ def main(args):
         save_path=os.path.join(results_dir, 'reconstruction_timeseries.png')
     )
 
-    # 9. Metrics summary
+    # 9. Metrics summary + TIR linear probe
     save_metrics_summary(history, pred_model, test_windows, masks_test,
                          scaler_mean_cgm, scaler_std_cgm, results_dir)
+    tir_probe(encoder, test_windows, scaler_mean_cgm, scaler_std_cgm, results_dir)
 
     print(f"\n{'='*52}")
     print(f"  Done. Results in: {results_dir}/")
