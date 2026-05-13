@@ -103,16 +103,35 @@ def build_transformer_encoder(window_len, n_features, d_model, n_heads,
     return keras.Model(inp, x, name='TransformerEncoder')
 
 
-def build_full_model(window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout):
+# Cross-entropy binning constants (must match experiment_mtsm.py)
+K_BINS          = 200
+GLOBAL_CGM_MEAN = 144.40
+GLOBAL_CGM_STD  = 57.11
+CGM_MG_MIN      = 40.0
+CGM_MG_MAX      = 400.0
+BIN_Z_MIN = (CGM_MG_MIN - GLOBAL_CGM_MEAN) / GLOBAL_CGM_STD
+BIN_Z_MAX = (CGM_MG_MAX - GLOBAL_CGM_MEAN) / GLOBAL_CGM_STD
+
+
+def build_full_model(window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout,
+                     ce_head: bool = False):
     """Rebuild MTSM model (encoder + 2-layer MLP reconstruction head)."""
     encoder = build_transformer_encoder(
         window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout
     )
-    inp  = keras.Input(shape=(window_len, n_features))
-    H    = encoder(inp)
-    x    = layers.Dense(64, activation='relu')(H)
-    out  = layers.Dense(1)(x)
-    out  = tf.squeeze(out, axis=-1)
+    inp = keras.Input(shape=(window_len, n_features))
+    H   = encoder(inp)
+    x   = layers.Dense(64, activation='relu')(H)
+    if ce_head:
+        logits = layers.Dense(K_BINS)(x)          # (B, T, K)
+        # Expected value: softmax → weighted sum over bin z-midpoints
+        bin_z  = np.array([(i + 0.5) / K_BINS * (BIN_Z_MAX - BIN_Z_MIN) + BIN_Z_MIN
+                            for i in range(K_BINS)], dtype=np.float32)
+        probs  = layers.Softmax(axis=-1)(logits)
+        out    = tf.reduce_sum(probs * tf.constant(bin_z)[None, None, :], axis=-1)  # (B, T)
+    else:
+        out = layers.Dense(1)(x)
+        out = tf.squeeze(out, axis=-1)
     model = keras.Model(inp, out)
     return model, encoder
 
@@ -130,8 +149,12 @@ def index_dataset(processed_dir: str, max_patients=None):
 
     for fname in npz_files:
         fpath = os.path.join(processed_dir, fname)
-        data  = np.load(fpath, allow_pickle=True)
-        wins  = data['windows']
+        try:
+            data  = np.load(fpath, allow_pickle=True)
+            wins  = data['windows'].astype(np.float32)
+        except Exception:
+            print(f"  [WARN] skipping corrupt file: {fname}")
+            continue
 
         bolus = wins[:, :, BOLUS_IDX]
         carbs = wins[:, :, CARBS_IDX]
@@ -155,8 +178,11 @@ def index_dataset(processed_dir: str, max_patients=None):
 def load_windows_from_index(index_sample: list) -> np.ndarray:
     windows = []
     for fpath, win_idx in index_sample:
-        data = np.load(fpath, allow_pickle=True)
-        windows.append(data['windows'][win_idx].astype(np.float32))
+        try:
+            data = np.load(fpath, allow_pickle=True)
+            windows.append(data['windows'][win_idx].astype(np.float32))
+        except Exception:
+            continue
     return np.stack(windows, axis=0)
 
 
@@ -303,7 +329,8 @@ def main(args):
             )
 
             model, encoder = build_full_model(
-                WINDOW_LEN, n_features_model, d_model, n_heads, N_LAYERS, d_ff, DROPOUT
+                WINDOW_LEN, n_features_model, d_model, n_heads, N_LAYERS, d_ff, DROPOUT,
+                ce_head=args.ce_head,
             )
             model(tf.zeros((1, WINDOW_LEN, n_features_model)), training=False)
             model.load_weights(model_path)
@@ -352,6 +379,44 @@ def main(args):
                 save_path=os.path.join(results_dir, 'reconstruction_timeseries.png')
             )
 
+    # Training curves from log file (no weights needed)
+    if args.log:
+        print("\n── Training Curves from Log ─────────────────────────────────────")
+        import re
+        log_text = open(args.log).read()
+        lines = [l for l in log_text.split('\n') if 'val_loss:' in l]
+        if lines:
+            def _parse(pat, line): return float(re.search(pat, line).group(1))
+            losses     = [_parse(r' loss: ([0-9.]+)',         l) for l in lines]
+            val_losses = [_parse(r'val_loss: ([0-9.]+)',      l) for l in lines]
+            # Accuracy (CE) or MAE (MSE) — detect whichever is present
+            if 'masked_acc' in lines[0]:
+                accs     = [_parse(r' masked_acc: ([0-9.]+)',     l) for l in lines]
+                val_accs = [_parse(r'val_masked_acc: ([0-9.]+)',  l) for l in lines]
+                sec_label = 'Masked Accuracy (top-1)'
+            else:
+                accs     = [_parse(r' masked_mae: ([0-9.]+)',     l) for l in lines]
+                val_accs = [_parse(r'val_masked_mae: ([0-9.]+)',  l) for l in lines]
+                sec_label = 'Masked MAE'
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            fig.suptitle(f'Training Curves — {args.run_id}', fontsize=13)
+            for ax, (tr, va, lbl) in zip(axes, [
+                (losses, val_losses, 'Loss'),
+                (accs,   val_accs,   sec_label),
+            ]):
+                ax.plot(tr, color='#2563EB', lw=2,   label='train')
+                ax.plot(va, color='#2563EB', lw=1.5, ls='--', label='val')
+                ax.set_xlabel('Epoch'); ax.set_ylabel(lbl); ax.set_title(lbl)
+                ax.legend(); ax.grid(True, alpha=0.3)
+                ax.spines[['top', 'right']].set_visible(False)
+            plt.tight_layout()
+            out = os.path.join(results_dir, 'training_curves.png')
+            plt.savefig(out, dpi=150, bbox_inches='tight'); plt.close()
+            print(f"  Saved: {out}")
+            print(f"  Best val_loss = {min(val_losses):.4f} at epoch {val_losses.index(min(val_losses))+1}")
+        else:
+            print("  No epoch summary lines found in log.")
+
     print(f"\n  Done. Plots saved to: {results_dir}/\n")
 
 
@@ -370,5 +435,9 @@ if __name__ == '__main__':
                         help='Which plots to generate: all | h (H analysis) | recon (reconstruction)')
     parser.add_argument('--n_windows', type=int, default=1500,
                         help='Windows for H analysis (default 1500)')
+    parser.add_argument('--ce_head',   action='store_true', default=False,
+                        help='CE reconstruction head (encoder_clean) — wraps logits as expected z-score')
+    parser.add_argument('--log',       type=str, default=None,
+                        help='Path to training log file — generates training_curves.png without retraining')
     args = parser.parse_args()
     main(args)

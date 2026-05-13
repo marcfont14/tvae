@@ -34,6 +34,7 @@ def train(model, splits, run_id, results_dir, epochs=50, lr=1e-3,
     history = model.fit(
         splits['train'],
         validation_data=splits['val'],
+        validation_steps=splits.get('val_steps'),
         epochs=epochs,
         steps_per_epoch=splits.get('steps_per_epoch'),
         callbacks=callbacks,

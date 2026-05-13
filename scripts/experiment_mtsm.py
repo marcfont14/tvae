@@ -77,6 +77,36 @@ class CLSToken(layers.Layer):
         self.cls = self.add_weight(shape=(1, 1, input_shape[-1]), name='cls_token')
     def call(self, x):
         return tf.concat([tf.tile(self.cls, [tf.shape(x)[0], 1, 1]), x], axis=1)
+
+class PrefixLMBlock(layers.Layer):
+    """Transformer block with prefix-LM attention mask (inline copy — kept in sync with src/encoder.py)."""
+    def __init__(self, d_model, n_heads, d_ff, dropout,
+                 prefix_len, seq_len, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.mhsa  = layers.MultiHeadAttention(
+            num_heads=n_heads, key_dim=d_model // n_heads, dropout=dropout)
+        self.drop1 = layers.Dropout(dropout)
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.ffn1  = layers.Dense(d_ff, activation='relu')
+        self.drop2 = layers.Dropout(dropout)
+        self.ffn2  = layers.Dense(d_model)
+        self.drop3 = layers.Dropout(dropout)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        rows    = np.arange(seq_len)[:, np.newaxis]
+        cols    = np.arange(seq_len)[np.newaxis, :]
+        blocked = (rows >= prefix_len) & (cols >= prefix_len) & (cols > rows)
+        self._mask = tf.constant((~blocked)[np.newaxis], dtype=tf.bool)
+
+    def call(self, x, training=False):
+        attn = self.mhsa(x, x, attention_mask=self._mask, training=training)
+        attn = self.drop1(attn, training=training)
+        x    = self.norm1(x + attn)
+        ffn  = self.ffn1(x)
+        ffn  = self.drop2(ffn, training=training)
+        ffn  = self.ffn2(ffn)
+        ffn  = self.drop3(ffn, training=training)
+        return self.norm2(x + ffn)
+
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
@@ -124,6 +154,15 @@ MULTIMODAL_PROB   = 0.0    # Idea 2: 0.0 = desactivado
 RESULTS_BASE = 'results/mtsm'
 SEED         = 42
 
+# Cross-entropy binning (encoder_clean)
+K_BINS          = 200
+CGM_MG_MIN      = 40.0
+CGM_MG_MAX      = 400.0
+GLOBAL_CGM_MEAN = 144.40   # mg/dL — from results/outlier_analysis/global_scaler.npy
+GLOBAL_CGM_STD  = 57.11    # mg/dL
+BIN_Z_MIN = (CGM_MG_MIN - GLOBAL_CGM_MEAN) / GLOBAL_CGM_STD   # ≈ -1.828
+BIN_Z_MAX = (CGM_MG_MAX - GLOBAL_CGM_MEAN) / GLOBAL_CGM_STD   # ≈ +4.474
+
 COLORS = {
     'cgm_real':  '#111827',
     'recon':     '#2563EB',
@@ -135,6 +174,19 @@ COLORS = {
 
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
+
+
+# ── Bin helpers (encoder_clean cross-entropy) ─────────────────────────────────
+
+def cgm_z_to_bin(cgm_z: np.ndarray) -> np.ndarray:
+    """Map z-score CGM values → integer bin indices [0, K_BINS-1]."""
+    t = (cgm_z - BIN_Z_MIN) / (BIN_Z_MAX - BIN_Z_MIN)
+    return np.clip((t * K_BINS).astype(np.int32), 0, K_BINS - 1).astype(np.float32)
+
+
+def bin_to_cgm_z(bin_idx: np.ndarray) -> np.ndarray:
+    """Map bin indices → z-score midpoints."""
+    return (bin_idx + 0.5) / K_BINS * (BIN_Z_MAX - BIN_Z_MIN) + BIN_Z_MIN
 
 
 # ── Positional Encoding ───────────────────────────────────────────────────────
@@ -180,17 +232,25 @@ def build_transformer_encoder(window_len, n_features, d_model, n_heads,
 # ── MTSM Model ────────────────────────────────────────────────────────────────
 
 def build_mtsm_model(window_len, n_features, d_model, n_heads, n_layers,
-                     d_ff, dropout, vicreg_lambda: float = 0.0):
+                     d_ff, dropout, vicreg_lambda: float = 0.0,
+                     no_causal: bool = False, ce_head: bool = False):
     inp     = keras.Input(shape=(window_len, n_features), name='input')
     encoder = build_transformer_encoder(
         window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout
     )
     H, h_cls = encoder(inp)
 
-    # Reconstruction head: full sequence → masked span MSE
+    # Reconstruction head
     recon = layers.Dense(64, activation='relu', name='recon_hidden')(H)
-    recon = layers.Dense(1,  name='reconstruction_head')(recon)
-    recon = layers.Reshape((window_len,), name='recon_output')(recon)
+    if ce_head:
+        # Cross-entropy: logits over K_BINS — no activation, no reshape
+        recon = layers.Dense(K_BINS, name='reconstruction_head')(recon)  # (B, T, K)
+    else:
+        recon = layers.Dense(1,  name='reconstruction_head')(recon)
+        recon = layers.Reshape((window_len,), name='recon_output')(recon)
+
+    if no_causal:
+        return keras.Model(inp, recon, name='MTSM_clean'), encoder
 
     # Causal prediction head: h_cls → last CAUSAL_TAIL CGM z-scores
     pred = layers.Dense(64, activation='relu', name='pred_hidden')(h_cls)
@@ -299,6 +359,49 @@ class MaskedMAE(keras.metrics.Metric):
         self.count.assign(0.)
 
 
+class MaskedCELoss(keras.losses.Loss):
+    """
+    Weighted sparse cross-entropy over masked positions only.
+    y_true: (B, 288, 3) = [bin_idx, mask, driver_weight]
+    y_pred: (B, 288, K_BINS)  — raw logits
+    """
+    def call(self, y_true, y_pred):
+        bin_idx       = tf.cast(y_true[:, :, 0], tf.int32)
+        mask          = y_true[:, :, 1]
+        driver_weight = y_true[:, :, 2]
+        ce = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=bin_idx, logits=y_pred
+        )  # (B, 288)
+        weighted = ce * mask * driver_weight
+        n_masked = tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-8
+        return tf.reduce_mean(
+            tf.reduce_sum(weighted, axis=1) / tf.squeeze(n_masked, axis=1)
+        )
+
+
+class MaskedCEAccuracy(keras.metrics.Metric):
+    """Top-1 accuracy at masked positions (bin_idx == argmax(logits))."""
+    def __init__(self, name='masked_acc', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.correct = self.add_weight(name='correct', initializer='zeros')
+        self.count   = self.add_weight(name='count',   initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        bin_idx = tf.cast(y_true[:, :, 0], tf.int32)
+        mask    = y_true[:, :, 1]
+        pred_bin = tf.cast(tf.argmax(y_pred, axis=-1), tf.int32)
+        correct  = tf.cast(tf.equal(bin_idx, pred_bin), tf.float32) * mask
+        self.correct.assign_add(tf.reduce_sum(correct))
+        self.count.assign_add(tf.reduce_sum(mask))
+
+    def result(self):
+        return self.correct / (self.count + 1e-8)
+
+    def reset_state(self):
+        self.correct.assign(0.)
+        self.count.assign(0.)
+
+
 class VICRegLoss(keras.losses.Loss):
     """
     VICReg regularisation on mean-pooled H (shape: (batch, d_model)).
@@ -366,7 +469,8 @@ def apply_masks_vectorized(wins: np.ndarray, mask_ratio: float,
                            mask_min_len: int, mask_max_len: int,
                            multimodal_prob: float,
                            no_logged_events: bool = False,
-                           no_age: bool = False):
+                           no_age: bool = False,
+                           ce_head: bool = False):
     """
     Applies masking and driver weighting to N windows at once.
     Driver weight accumulation is fully vectorized over the batch axis.
@@ -392,9 +496,10 @@ def apply_masks_vectorized(wins: np.ndarray, mask_ratio: float,
         if multimodal_prob > 0 and np.random.random() < multimodal_prob:
             # 2:1 PI over RA — PI is richer signal, RA is sparser
             ch = int(np.random.choice([PI_IDX, RA_IDX], p=[2/3, 1/3]))
-        m          = create_mask(WINDOW_LEN, mask_ratio, mask_min_len, mask_max_len)
-        targets[i] = wins[i, :, ch]
-        masks[i]   = m
+        m             = create_mask(WINDOW_LEN, mask_ratio, mask_min_len, mask_max_len)
+        raw_target    = wins[i, :, ch]
+        targets[i]    = cgm_z_to_bin(raw_target) if (ce_head and ch == CGM_IDX) else raw_target
+        masks[i]      = m
         x_masked[i, m.astype(bool), ch] = MASK_TOKEN
 
     # Vectorized driver weights across all N windows
@@ -426,7 +531,8 @@ def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
                         mask_min_len: int, mask_max_len: int,
                         multimodal_prob: float,
                         no_logged_events: bool = False,
-                        no_age: bool = False) -> tf.data.Dataset:
+                        no_age: bool = False,
+                        ce_head: bool = False) -> tf.data.Dataset:
     """
     Builds a tf.data.Dataset from an index of (fpath, win_idx) tuples.
 
@@ -458,7 +564,7 @@ def make_window_dataset(index: list, shuffle: bool, mask_ratio: float,
                 continue
             x_masked, Y, last_6 = apply_masks_vectorized(
                 wins, mask_ratio, mask_min_len, mask_max_len, multimodal_prob,
-                no_logged_events=no_logged_events, no_age=no_age
+                no_logged_events=no_logged_events, no_age=no_age, ce_head=ce_head
             )
             if shuffle:
                 perm     = np.random.permutation(len(wins))
@@ -554,14 +660,16 @@ def plot_training_curves(history, save_path: str):
                  fontsize=14, fontweight='bold')
 
     if 'recon_output_masked_mae' in history:
-        mae_key = 'recon_output_masked_mae'
+        sec_key, sec_label = 'recon_output_masked_mae', 'Masked MAE'
     elif 'output_masked_mae' in history:
-        mae_key = 'output_masked_mae'
+        sec_key, sec_label = 'output_masked_mae', 'Masked MAE'
+    elif 'masked_acc' in history:
+        sec_key, sec_label = 'masked_acc', 'Masked Accuracy (top-1)'
     else:
-        mae_key = 'masked_mae'
+        sec_key, sec_label = 'masked_mae', 'Masked MAE'
 
-    for ax, (metric, label) in zip(axes, [('loss', 'Masked MSE Loss (+ shape)'),
-                                           (mae_key, 'Masked MAE')]):
+    for ax, (metric, label) in zip(axes, [('loss', 'Loss'),
+                                           (sec_key, sec_label)]):
         ax.plot(history[metric],
                 color='#2563EB', lw=2, ls='-', label='train')
         ax.plot(history[f'val_{metric}'],
@@ -701,17 +809,19 @@ def plot_reconstruction_examples(model, windows_orig: np.ndarray,
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-def index_dataset(processed_dir: str, max_patients: int = None) -> list:
+def index_dataset(processed_dir: str, max_patients: int = None,
+                  allowed_files: set = None) -> list:
     """
     Builds an index of (filepath, window_idx) tuples without loading data into RAM.
     Applies quality filters per patient: has_driver and cgm_std in valid range.
-    
-    Returns:
-        List of (filepath, window_idx) tuples — one entry per valid window.
+    allowed_files: if provided, only include patients whose filename is in this set.
     """
     npz_files = sorted([f for f in os.listdir(processed_dir) if f.endswith('.npz')])
     if not npz_files:
         raise FileNotFoundError(f"No .npz files found in {processed_dir}")
+    if allowed_files is not None:
+        npz_files = [f for f in npz_files if f in allowed_files]
+        print(f"  (--pretrain_patients: using {len(npz_files)} non-test patients)")
     if max_patients is not None:
         npz_files = npz_files[:max_patients]
         print(f"  (--max_patients {max_patients}: loading subset)")
@@ -1229,29 +1339,177 @@ def save_metrics_summary(history, model, windows_orig, masks,
     print(f"{'='*52}")
 
 
+# ── Encoder3 — Prefix-LM training path ───────────────────────────────────────
+
+PREFIX_LEN_E3    = 144   # steps 0-143 bidirectional, 144-287 causal+full-prefix
+BIDIR_MASK_MIN   = 60    # 5h  — same as Stage 1 default
+BIDIR_MASK_MAX   = 96    # 8h
+CAUSAL_MASK_MIN  = 6     # 30 min — short spans to force momentum learning
+CAUSAL_MASK_MAX  = 12    # 60 min
+
+
+def build_transformer_encoder_v3(window_len, n_features, d_model, n_heads,
+                                  n_layers, d_ff, dropout):
+    """Encoder3: Prefix-LM attention mask, no CLS token."""
+    inp = keras.Input(shape=(window_len, n_features), name='input')
+    x   = layers.Dense(d_model, name='input_proj')(inp)
+    x   = x + get_positional_encoding(window_len, d_model)
+    for i in range(n_layers):
+        x = PrefixLMBlock(d_model, n_heads, d_ff, dropout,
+                          PREFIX_LEN_E3, window_len, name=f'prefix_lm_{i}')(x)
+    h_last = layers.Lambda(lambda z: z[:, -1, :], name='h_last')(x)
+    return keras.Model(inp, [x, h_last], name='TransformerEncoder3')
+
+
+def build_mtsm_v3(window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout):
+    """MTSM for encoder3: masked reconstruction only (no causal prediction aux loss)."""
+    inp     = keras.Input(shape=(window_len, n_features), name='input')
+    encoder = build_transformer_encoder_v3(
+        window_len, n_features, d_model, n_heads, n_layers, d_ff, dropout
+    )
+    H, h_last = encoder(inp)
+    recon = layers.Dense(64, activation='relu', name='recon_hidden')(H)
+    recon = layers.Dense(1,  name='reconstruction_head')(recon)
+    recon = layers.Reshape((window_len,), name='recon_output')(recon)
+    return keras.Model(inp, recon, name='MTSM_v3'), encoder
+
+
+def _apply_spans(mask, region_start, region_end, ratio, min_len, max_len):
+    """Apply random contiguous spans within [region_start, region_end) of mask."""
+    region_len = region_end - region_start
+    target     = int(region_len * ratio)
+    masked     = 0
+    attempts   = 0
+    max_span   = min(max_len, region_len)
+    while masked < target and attempts < 50:
+        span  = np.random.randint(min_len, max_span + 1)
+        start = np.random.randint(region_start, region_end - span + 1)
+        mask[start:start + span] = 1
+        masked   = int(mask[region_start:region_end].sum())
+        attempts += 1
+
+
+def create_mask_asymmetric(window_len=WINDOW_LEN, prefix_len=PREFIX_LEN_E3,
+                            bidir_ratio=MASK_RATIO, causal_ratio=MASK_RATIO):
+    """
+    Asymmetric masking for encoder3.
+    Bidirectional half [0, prefix_len): long spans (5–8h) at bidir_ratio.
+    Causal half [prefix_len, window_len): short spans (30–60 min) at causal_ratio.
+    Spans are clipped to their respective halves — no regime bleeding.
+    """
+    mask = np.zeros(window_len, dtype=np.float32)
+    _apply_spans(mask, 0,          prefix_len,  bidir_ratio,  BIDIR_MASK_MIN,  BIDIR_MASK_MAX)
+    _apply_spans(mask, prefix_len, window_len,  causal_ratio, CAUSAL_MASK_MIN, CAUSAL_MASK_MAX)
+    return mask
+
+
+def apply_masks_v3(wins, no_age=False):
+    """
+    Masking for encoder3: asymmetric spans, no CAUSAL_TAIL zeroing, no last_6.
+    Returns (x_masked (N, T, F), Y (N, T, 3)) where Y = [target, mask, driver_weight].
+    """
+    N        = len(wins)
+    x_masked = wins.copy()
+    masks    = np.zeros((N, WINDOW_LEN), dtype=np.float32)
+    targets  = np.zeros((N, WINDOW_LEN), dtype=np.float32)
+
+    for i in range(N):
+        m          = create_mask_asymmetric()
+        targets[i] = wins[i, :, CGM_IDX]
+        masks[i]   = m
+        x_masked[i, m.astype(bool), CGM_IDX] = MASK_TOKEN
+
+    bolus        = wins[:, :, BOLUS_IDX]
+    carbs        = wins[:, :, CARBS_IDX]
+    driver_event = ((bolus + carbs) > 0).astype(np.float32)
+    driver_infl  = np.zeros((N, WINDOW_LEN), dtype=np.float32)
+    for offset in range(1, DRIVER_EFFECT_STEPS + 1):
+        driver_infl[:, offset:] += driver_event[:, :-offset]
+    driver_infl   = np.clip(driver_infl, 0, 1)
+    driver_weight = np.where(
+        (driver_infl > 0) & (masks > 0), DRIVER_LOSS_WEIGHT, 1.0
+    ).astype(np.float32)
+
+    if no_age:
+        x_masked = x_masked[:, :, :10]
+
+    Y = np.stack([targets, masks, driver_weight], axis=-1)
+    return x_masked.astype(np.float32), Y
+
+
+def make_window_dataset_v3(index, shuffle, no_age=False):
+    """
+    tf.data pipeline for encoder3. Yields (x_masked, Y) — no last_6 output,
+    because encoder3 drops the causal prediction aux loss.
+    """
+    from collections import defaultdict
+    patient_to_windows = defaultdict(list)
+    for fpath, win_idx in index:
+        patient_to_windows[fpath].append(win_idx)
+    fpaths = list(patient_to_windows.keys())
+
+    def generator():
+        order = np.random.permutation(len(fpaths)) if shuffle else range(len(fpaths))
+        for pi in order:
+            fpath       = fpaths[pi]
+            win_indices = np.array(patient_to_windows[fpath], dtype=np.int32)
+            try:
+                data = np.load(fpath, allow_pickle=True)
+                wins = data['windows'][win_indices].astype(np.float32)
+            except Exception as e:
+                print(f'[WARN] skipping {fpath}: {e}', flush=True)
+                continue
+            x_masked, Y = apply_masks_v3(wins, no_age=no_age)
+            if shuffle:
+                perm     = np.random.permutation(len(wins))
+                x_masked = x_masked[perm]
+                Y        = Y[perm]
+            yield x_masked, Y
+
+    n_features_out = 10 if no_age else N_FEATURES
+    ds = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(None, WINDOW_LEN, n_features_out), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, WINDOW_LEN, 3),              dtype=tf.float32),
+        )
+    )
+    ds = ds.unbatch()
+    if shuffle:
+        ds = ds.shuffle(buffer_size=5_000, seed=SEED)
+    ds = ds.batch(BATCH_SIZE)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
 # ── TIR linear probe ─────────────────────────────────────────────────────────
 
-def tir_probe(encoder, test_windows, scaler_means, scaler_stds, results_dir):
+def tir_probe(encoder, test_windows, scaler_means, scaler_stds, results_dir,
+              build_encoder_fn=None):
     """
-    Probe: Ridge(h_cls → TIR%) vs. random-init baseline.
-    R² delta directly measures how much MTSM pre-training enriches h_cls.
+    Probe: Ridge(h_summary → TIR%) vs. random-init baseline.
+    h_summary = h_cls (encoder2) or h_last (encoder3).
+    R² delta directly measures how much MTSM pre-training enriches the summary vector.
     """
     import json
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import train_test_split
 
-    print("\n  TIR linear probe (h_cls → TIR%) ...")
+    if build_encoder_fn is None:
+        build_encoder_fn = build_transformer_encoder
+
+    print("\n  TIR linear probe (h_summary → TIR%) ...")
 
     cgm_z  = test_windows[:, :, CGM_IDX]
     cgm_mg = cgm_z * scaler_stds[:, None] + scaler_means[:, None]
     tir    = ((cgm_mg >= 70) & (cgm_mg <= 180)).mean(axis=1) * 100  # (N,)
 
-    # h_cls from trained encoder
+    # summary vector from trained encoder (index [1] = h_cls or h_last)
     h_cls = encoder.predict(test_windows, batch_size=BATCH_SIZE, verbose=0)[1]  # (N, D_MODEL)
 
-    # h_cls from random-init encoder — baseline, expect R² ≈ 0
+    # random-init baseline — expect R² ≈ 0
     n_feat   = test_windows.shape[2]
-    enc_rand = build_transformer_encoder(
+    enc_rand = build_encoder_fn(
         WINDOW_LEN, n_feat, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
     )
     enc_rand(tf.zeros((1, WINDOW_LEN, n_feat)))
@@ -1326,7 +1584,12 @@ def main(args):
 
     # 1. Index dataset
     print(f"\n  Indexing dataset from: {args.data}")
-    index = index_dataset(args.data, args.max_patients)
+    allowed_files = None
+    if args.pretrain_patients:
+        with open(args.pretrain_patients) as fh:
+            allowed_files = set(line.strip() for line in fh if line.strip())
+        print(f"  Pretrain whitelist: {len(allowed_files)} patients from {args.pretrain_patients}")
+    index = index_dataset(args.data, args.max_patients, allowed_files=allowed_files)
 
     # 2. Patient-level split
     all_fpaths = sorted(list(set(fp for fp, _ in index)))
@@ -1346,62 +1609,181 @@ def main(args):
     print(f"  Patient split — Train: {len(train_set)}  Val: {len(val_set)}  Test: {len(test_set)}")
     print(f"  Window split  — Train: {len(train_index):,}  Val: {len(val_index):,}  Test: {len(test_index):,}")
 
-    # 3. Build tf.data pipelines
-    ds_kwargs = dict(
-        mask_ratio=args.mask_ratio, mask_min_len=MASK_MIN_LEN,
-        mask_max_len=args.mask_max_len, multimodal_prob=args.multimodal_prob,
-        no_logged_events=args.no_logged_events, no_age=args.no_age
-    )
-
-    train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
-    val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
-
-    # 4. Build model
     n_features_model = 10 if args.no_age else N_FEATURES
-    model, encoder = build_mtsm_model(
-        WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
-    )
 
-    model.compile(
-        optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
-        loss=[MaskedMSELoss(shape_loss_lambda=args.shape_loss), keras.losses.Huber()],
-        loss_weights=[1.0, 0.25],
-        metrics={'recon_output': [MaskedMAE()]}
-    )
+    if args.prefix_lm:
+        # ── Encoder3 path ────────────────────────────────────────────────────
+        print(f"\n  [encoder3] Prefix-LM mask | bidir[0-143] | causal[144-287]")
+        print(f"  [encoder3] Bidir spans: {BIDIR_MASK_MIN*5//60}–{BIDIR_MASK_MAX*5//60}h  "
+              f"Causal spans: {CAUSAL_MASK_MIN*5}–{CAUSAL_MASK_MAX*5}min")
 
-    model.summary()
+        # 3e. Build tf.data pipelines (asymmetric masking, no last_6)
+        train_ds = make_window_dataset_v3(
+            train_index, shuffle=True, no_age=args.no_age
+        ).repeat()
+        val_ds   = make_window_dataset_v3(
+            val_index, shuffle=False, no_age=args.no_age
+        )
 
-    # 5. Train
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=10,
-            restore_best_weights=True, verbose=1
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5,
-            patience=5, min_lr=1e-6, verbose=1
-        ),
-    ]
+        # 4e. Build model (recon head only — no causal aux loss)
+        model, encoder = build_mtsm_v3(
+            WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
+        )
+        model.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+            loss=MaskedMSELoss(shape_loss_lambda=args.shape_loss),
+            metrics=[MaskedMAE()]
+        )
+        model.summary()
 
-    steps_per_epoch = len(train_index) // BATCH_SIZE
-    history_obj = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=args.epochs,
-        steps_per_epoch=steps_per_epoch,
-        callbacks=callbacks,
-        verbose=1
-    )
-    history = history_obj.history
+        # 5e. Train
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=10,
+                restore_best_weights=True, verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5,
+                patience=5, min_lr=1e-6, verbose=1
+            ),
+        ]
+        steps_per_epoch = len(train_index) // BATCH_SIZE
+        history_obj = model.fit(
+            train_ds, validation_data=val_ds,
+            epochs=args.epochs, steps_per_epoch=steps_per_epoch,
+            callbacks=callbacks, verbose=1
+        )
+        history = history_obj.history
 
-    # 6. Save weights — encoder (for Stage 2) + reconstruction head (for replotting)
-    encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
-    encoder.save_weights(encoder_path)
-    model_path = os.path.join(results_dir, 'model_weights.weights.h5')
-    pred_model_to_save = keras.Model(model.input, model.output[0], name='MTSM_recon')
-    pred_model_to_save.save_weights(model_path)
-    print(f"\n  Encoder weights saved: {encoder_path}")
-    print(f"  Full model weights saved: {model_path}")
+        # 6e. Save weights
+        encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
+        encoder.save_weights(encoder_path)
+        model.save_weights(os.path.join(results_dir, 'model_weights.weights.h5'))
+        print(f"\n  Encoder weights saved: {encoder_path}")
+
+        # pred_model for plots — encoder3 model already has single output
+        pred_model = model
+
+        # masks for plots: asymmetric
+        masks_fn   = lambda: create_mask_asymmetric()
+        build_fn   = build_transformer_encoder_v3
+
+    elif args.ce_head or args.no_causal_aux:
+        # ── encoder_clean path (CE head + no causal aux loss) ────────────────
+        print(f"\n  [encoder_clean] CE head (K={K_BINS} bins)  |  no causal aux loss")
+        print(f"  [encoder_clean] Bin grid: [{CGM_MG_MIN:.0f}, {CGM_MG_MAX:.0f}] mg/dL  "
+              f"→  z [{BIN_Z_MIN:.3f}, {BIN_Z_MAX:.3f}]")
+
+        ds_kwargs = dict(
+            mask_ratio=args.mask_ratio, mask_min_len=MASK_MIN_LEN,
+            mask_max_len=args.mask_max_len, multimodal_prob=args.multimodal_prob,
+            no_logged_events=args.no_logged_events, no_age=args.no_age,
+            ce_head=True,
+        )
+        train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
+        val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
+
+        model, encoder = build_mtsm_model(
+            WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT,
+            no_causal=True, ce_head=True,
+        )
+        model.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+            loss=MaskedCELoss(),
+            metrics=[MaskedCEAccuracy()],
+        )
+        model.summary()
+
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=10,
+                restore_best_weights=True, verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5,
+                patience=5, min_lr=1e-6, verbose=1
+            ),
+        ]
+        steps_per_epoch = len(train_index) // BATCH_SIZE
+        history_obj = model.fit(
+            train_ds, validation_data=val_ds,
+            epochs=args.epochs, steps_per_epoch=steps_per_epoch,
+            callbacks=callbacks, verbose=1
+        )
+        history = history_obj.history
+
+        encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
+        encoder.save_weights(encoder_path)
+        model.save_weights(os.path.join(results_dir, 'model_weights.weights.h5'))
+        print(f"\n  Encoder weights saved: {encoder_path}")
+
+        # Wrap CE model for visualisation: logits → expected z-score
+        bin_z_vals = tf.constant(
+            bin_to_cgm_z(np.arange(K_BINS, dtype=np.float32)), dtype=tf.float32
+        )
+        _inp_viz  = keras.Input(shape=(WINDOW_LEN, n_features_model))
+        _logits   = model(_inp_viz)                               # (B, T, K)
+        _probs    = tf.nn.softmax(_logits, axis=-1)
+        _pred_z   = tf.reduce_sum(_probs * bin_z_vals[None, None, :], axis=-1)  # (B, T)
+        pred_model = keras.Model(_inp_viz, _pred_z, name='MTSM_clean_viz')
+
+        masks_fn  = lambda: create_mask(WINDOW_LEN, args.mask_ratio, MASK_MIN_LEN, args.mask_max_len)
+        build_fn  = build_transformer_encoder
+
+    else:
+        # ── Encoder2 path (original) ─────────────────────────────────────────
+        # 3. Build tf.data pipelines
+        ds_kwargs = dict(
+            mask_ratio=args.mask_ratio, mask_min_len=MASK_MIN_LEN,
+            mask_max_len=args.mask_max_len, multimodal_prob=args.multimodal_prob,
+            no_logged_events=args.no_logged_events, no_age=args.no_age
+        )
+        train_ds = make_window_dataset(train_index, shuffle=True,  **ds_kwargs).repeat()
+        val_ds   = make_window_dataset(val_index,   shuffle=False, **ds_kwargs)
+
+        # 4. Build model
+        model, encoder = build_mtsm_model(
+            WINDOW_LEN, n_features_model, D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT
+        )
+        model.compile(
+            optimizer=keras.optimizers.AdamW(learning_rate=LR, weight_decay=1e-4),
+            loss=[MaskedMSELoss(shape_loss_lambda=args.shape_loss), keras.losses.Huber()],
+            loss_weights=[1.0, 0.25],
+            metrics={'recon_output': [MaskedMAE()]}
+        )
+        model.summary()
+
+        # 5. Train
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=10,
+                restore_best_weights=True, verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5,
+                patience=5, min_lr=1e-6, verbose=1
+            ),
+        ]
+        steps_per_epoch = len(train_index) // BATCH_SIZE
+        history_obj = model.fit(
+            train_ds, validation_data=val_ds,
+            epochs=args.epochs, steps_per_epoch=steps_per_epoch,
+            callbacks=callbacks, verbose=1
+        )
+        history = history_obj.history
+
+        # 6. Save weights
+        encoder_path = os.path.join(results_dir, 'encoder_weights.weights.h5')
+        encoder.save_weights(encoder_path)
+        pred_model_to_save = keras.Model(model.input, model.output[0], name='MTSM_recon')
+        pred_model_to_save.save_weights(
+            os.path.join(results_dir, 'model_weights.weights.h5')
+        )
+        print(f"\n  Encoder weights saved: {encoder_path}")
+
+        pred_model = keras.Model(model.input, model.output[0], name='MTSM_recon')
+        masks_fn   = lambda: create_mask(WINDOW_LEN, args.mask_ratio, MASK_MIN_LEN, args.mask_max_len)
+        build_fn   = build_transformer_encoder
 
     # 7. Load a bounded test sample for plots (500 windows max)
     N_PLOT = 500
@@ -1417,27 +1799,17 @@ def main(args):
     if args.no_age:
         test_windows = test_windows[:, :, :10]
 
-    # Build single-output model (recon head only) for plots and metrics
-    pred_model = keras.Model(model.input, model.output[0], name='MTSM_recon')
-
     # 8. Plots
     print(f"\n{'='*52}")
     print(f"  Generating plots")
     print(f"{'='*52}")
 
-    masks_test = np.stack([
-        create_mask(WINDOW_LEN, args.mask_ratio, MASK_MIN_LEN, args.mask_max_len)
-        for _ in range(len(test_windows))
-    ])
+    masks_test = np.stack([masks_fn() for _ in range(len(test_windows))])
 
-    # Load per-window scalers for inverse-transform (CGM z-score → mg/dL)
     print(f"\n  Loading scalers for {len(plot_index)} test windows...")
     scaler_mean_cgm, scaler_std_cgm = load_scalers_from_index(plot_index)
 
-    plot_training_curves(
-        history,
-        os.path.join(results_dir, 'training_curves.png')
-    )
+    plot_training_curves(history, os.path.join(results_dir, 'training_curves.png'))
 
     plot_reconstruction_examples(
         pred_model, test_windows, masks_test,
@@ -1446,13 +1818,11 @@ def main(args):
         mask_max_len=args.mask_max_len,
         save_path=os.path.join(results_dir, 'reconstruction_examples.png')
     )
-
     plot_reconstruction_quality(
         pred_model, test_windows, masks_test,
         scaler_mean_cgm, scaler_std_cgm,
         save_path=os.path.join(results_dir, 'reconstruction_quality.png')
     )
-
     plot_reconstruction_timeseries(
         pred_model, test_windows, masks_test,
         save_path=os.path.join(results_dir, 'reconstruction_timeseries.png')
@@ -1461,7 +1831,8 @@ def main(args):
     # 9. Metrics summary + TIR linear probe
     save_metrics_summary(history, pred_model, test_windows, masks_test,
                          scaler_mean_cgm, scaler_std_cgm, results_dir)
-    tir_probe(encoder, test_windows, scaler_mean_cgm, scaler_std_cgm, results_dir)
+    tir_probe(encoder, test_windows, scaler_mean_cgm, scaler_std_cgm, results_dir,
+              build_encoder_fn=build_fn)
 
     print(f"\n{'='*52}")
     print(f"  Done. Results in: {results_dir}/")
@@ -1499,6 +1870,11 @@ if __name__ == '__main__':
                         help='Drop age_norm (feature 10) from encoder input. '
                              'Late fusion design: age passed to downstream heads only, '
                              'not to the encoder, to avoid demographic shortcuts.')
+    # Encoder3: prefix-LM attention mask, no CLS token, asymmetric masking
+    parser.add_argument('--prefix_lm', action='store_true', default=False,
+                        help='Train encoder3: prefix-LM attention mask (bidir[0-143] + '
+                             'causal[144-287]), no CLS token, asymmetric masking '
+                             '(5-8h bidir spans, 30-60min causal spans), no aux loss.')
     # Run 15: VICReg regularisation on mean-pooled H
     parser.add_argument('--vicreg_lambda', type=float, default=0.0,
                         help='Weight of VICReg loss on mean-pooled H (default 0.0=off). '
@@ -1516,5 +1892,16 @@ if __name__ == '__main__':
                         help=f'Number of attention heads (default {N_HEADS})')
     parser.add_argument('--d_ff', type=int, default=D_FF,
                         help=f'Feed-forward hidden dimension (default {D_FF})')
+    # encoder_clean flags
+    parser.add_argument('--ce_head', action='store_true', default=False,
+                        help='Replace Dense(1)+MSE reconstruction head with '
+                             'Dense(K_BINS)+cross-entropy over global mg/dL bins. '
+                             'Use with --no_causal_aux for encoder_clean.')
+    parser.add_argument('--no_causal_aux', action='store_true', default=False,
+                        help='Remove causal prediction aux loss (h_cls → last 6 CGM steps). '
+                             'h_cls becomes a pure global summary with no recency bias.')
+    parser.add_argument('--pretrain_patients', type=str, default=None,
+                        help='Path to .txt file with allowed patient filenames (one per line). '
+                             'Use to exclude test patients from pre-training.')
     args = parser.parse_args()
     main(args)

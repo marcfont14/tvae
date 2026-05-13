@@ -9,9 +9,9 @@ WINDOW_LEN = 288
 # (only holds when no windows were filtered between i and i+LOOKAHEAD).
 LOOKAHEAD  = WINDOW_LEN // STRIDE   # = 4
 
-# 6 horizons: t+5, t+10, ..., t+30 min  (local indices 0..5 in window[i+LOOKAHEAD])
-N_HORIZONS     = 6
-HORIZON_LABELS = ['5min', '10min', '15min', '20min', '25min', '30min']
+# 24 horizons: t+5, t+10, ..., t+120 min  (local indices 0..23 in window[i+LOOKAHEAD])
+N_HORIZONS     = 24
+HORIZON_LABELS = [f'{(i+1)*5}min' for i in range(N_HORIZONS)]
 
 # Feature indices in the window tensor
 IDX_CGM, IDX_PI, IDX_RA  = 0, 1, 2
@@ -25,8 +25,9 @@ IDX_BOLUS, IDX_CARBS      = 5, 6
 # majority of 6 h+ gaps (which produce jumps >> 1 z-score unit).
 CONTIGUITY_THRESHOLD = 1.0
 
-HYPO_THRESHOLD = 70.0   # mg/dL
-HYPO_AHEAD     = 24     # timesteps = 2 h at 5-min resolution
+HYPO_THRESHOLD         = 70.0   # mg/dL
+HYPO_AHEAD             = 24     # timesteps = 2 h at 5-min resolution
+HYPO_AHEAD_NOCTURNAL   = 96     # timesteps = 8 h (full night, bedtime_only mode)
 
 # Imputation gap lengths matching MTSM training distribution (steps × 5min = duration)
 # MTSM was trained with MASK_MIN_LEN=60 (5h) and MASK_MAX_LEN=96 (8h).
@@ -109,7 +110,8 @@ def _forecasting_gen(patients):
 
 
 def make_forecasting_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
-                              batch_size: int = 128):
+                              batch_size: int = 128,
+                              max_train_patients: Optional[int] = None):
     """
     Returns train/val/test tf.data.Dataset objects split by patient.
 
@@ -117,10 +119,14 @@ def make_forecasting_dataset(patients, val_split: float = 0.1, test_split: float
       window    : 24 h multimodal input in z-score
       last_cgm  : last observed CGM value in mg/dL (skip-connection anchor)
       y_cgm_mg  : CGM in mg/dL at t+5…t+30 min (absolute, not delta)
+    max_train_patients caps only the training split; val/test remain at full size.
     """
     import tensorflow as tf
 
     train_p, val_p, test_p = _patient_split(patients, val_split, test_split)
+    if max_train_patients is not None and max_train_patients < len(train_p):
+        train_p = train_p[:max_train_patients]
+        print(f'  Data efficiency: capped train to {len(train_p)} patients', flush=True)
     print(f'  Patients — train:{len(train_p)}  val:{len(val_p)}  test:{len(test_p)}',
           flush=True)
 
@@ -145,14 +151,56 @@ def make_forecasting_dataset(patients, val_split: float = 0.1, test_split: float
     steps_per_epoch = sum(1 for _ in make_ds(train_p, shuffle=False))
     print(f'  steps_per_epoch: {steps_per_epoch}', flush=True)
 
+    print('  Counting val steps (one pass)...', flush=True)
+    val_steps = sum(1 for _ in make_ds(val_p, shuffle=False))
+    print(f'  val_steps: {val_steps}', flush=True)
+
     return {
         'train':           make_ds(train_p, shuffle=True, repeat=True),
-        'val':             make_ds(val_p,   shuffle=False),
+        'val':             make_ds(val_p,   shuffle=False, repeat=True),
         'test':            make_ds(test_p,  shuffle=False),
         'steps_per_epoch': steps_per_epoch,
+        'val_steps':       val_steps,
         'val_patients':    val_p,
         'test_patients':   test_p,
         'batch_size':      batch_size,
+    }
+
+
+def make_ar_eval_data(patients) -> dict:
+    """
+    Collect all test windows with per-patient scalers for AR decoder evaluation.
+    Returns numpy arrays — not a tf.data pipeline — so predict_ar_decoder can
+    do serial rollout with access to scaler_std for z→mg/dL conversion.
+    Applies the same contiguity gate as _forecasting_gen for comparable metrics.
+    """
+    all_windows, all_last_mg, all_last_z, all_std, all_y_mg = [], [], [], [], []
+    for path, no_age in patients:
+        try:
+            windows, scaler_mean, scaler_std = load_patient(path, no_age)
+        except Exception as e:
+            print(f'  WARNING: skipping {os.path.basename(path)}: {e}', flush=True)
+            continue
+        for i in range(len(windows) - LOOKAHEAD):
+            delta_z = abs(float(windows[i, -1, IDX_CGM])
+                          - float(windows[i + LOOKAHEAD, 0, IDX_CGM]))
+            if delta_z > CONTIGUITY_THRESHOLD:
+                continue
+            last_mg = float(windows[i, -1, IDX_CGM]) * scaler_std + scaler_mean
+            labels_z = windows[i + LOOKAHEAD, 0:N_HORIZONS, IDX_CGM]
+            cgm_mg   = (labels_z * scaler_std + scaler_mean).astype(np.float32)
+            all_windows.append(windows[i])
+            all_last_mg.append(last_mg)
+            all_last_z.append(float(windows[i, -1, IDX_CGM]))
+            all_std.append(scaler_std)
+            all_y_mg.append(cgm_mg)
+    print(f'  AR eval: {len(all_windows):,} windows loaded', flush=True)
+    return {
+        'windows':     np.stack(all_windows).astype(np.float32),
+        'last_cgm_mg': np.array(all_last_mg,  dtype=np.float32),
+        'last_cgm_z':  np.array(all_last_z,   dtype=np.float32),
+        'scaler_std':  np.array(all_std,       dtype=np.float32),
+        'y_mg':        np.stack(all_y_mg).astype(np.float32),
     }
 
 
@@ -174,17 +222,21 @@ def make_eval_dataset(patients, batch_size: int = 128):
     return ds.batch(batch_size).prefetch(2)
 
 
-def _hypo_gen(patients):
+def _hypo_gen(patients, bedtime_only: bool = False):
     """
     Yields (window (288,10), label (2,)) for nocturnal hypo-risk (Weibull survival).
 
-    Nocturnal filter: only yield pairs where the prediction horizon (window[i+LOOKAHEAD])
-    starts between 22:00 and 06:00, decoded from hour_sin/cos.
+    bedtime_only=False (default):
+      Nocturnal filter — horizon starts between 22:00 and 06:00; HYPO_AHEAD=24 (2h).
+    bedtime_only=True:
+      Bedtime filter — horizon starts between 20:00 and 23:59; HYPO_AHEAD_NOCTURNAL=96
+      (8h). Covers the full nocturnal period from bedtime to morning.
 
     Label = [time_to_event, delta] where:
-      time_to_event: first step (1-indexed) where CGM < 70 mg/dL, or HYPO_AHEAD if none
+      time_to_event: first step (1-indexed) where CGM < 70 mg/dL, or ahead if none
       delta:         1.0 if hypo observed, 0.0 if censored
     """
+    ahead = HYPO_AHEAD_NOCTURNAL if bedtime_only else HYPO_AHEAD
     for path, no_age in patients:
         try:
             windows, mean, std = load_patient(path, no_age)
@@ -196,32 +248,41 @@ def _hypo_gen(patients):
                           - float(windows[i + LOOKAHEAD, 0, IDX_CGM]))
             if delta_z > CONTIGUITY_THRESHOLD:
                 continue
-            # Nocturnal filter: prediction horizon must start between 22:00 and 06:00
             hsin = float(windows[i + LOOKAHEAD, 0, IDX_HSIN])
             hcos = float(windows[i + LOOKAHEAD, 0, IDX_HCOS])
             hour = np.arctan2(hsin, hcos) / (2 * np.pi) * 24 % 24
-            if not (hour >= 22 or hour < 6):
-                continue
-            future_mg = windows[i + LOOKAHEAD, :HYPO_AHEAD, IDX_CGM] * std + mean
+            if bedtime_only:
+                if not (20 <= hour < 24):   # evening 20:00–23:59 → predict full night
+                    continue
+            else:
+                if not (hour >= 22 or hour < 6):   # original nocturnal filter
+                    continue
+            future_mg  = windows[i + LOOKAHEAD, :ahead, IDX_CGM] * std + mean
             hypo_steps = np.where(future_mg < HYPO_THRESHOLD)[0]
             if hypo_steps.size > 0:
                 t_event = float(hypo_steps[0] + 1)   # 1-indexed steps
                 event   = 1.0
             else:
-                t_event = float(HYPO_AHEAD)           # censored at horizon end
+                t_event = float(ahead)                # censored at horizon end
                 event   = 0.0
             yield windows[i], np.array([t_event, event], dtype=np.float32)
 
 
 def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
-                       batch_size: int = 128):
+                       batch_size: int = 128,
+                       max_train_patients: Optional[int] = None,
+                       bedtime_only: bool = False):
     """
     Returns train/val/test tf.data.Dataset objects for nocturnal hypo-risk (Weibull).
     Label is [time_to_event, delta] — no pos_weight needed for Weibull NLL.
+    max_train_patients caps only the training split; val/test remain at full size.
     """
     import tensorflow as tf
 
     train_p, val_p, test_p = _patient_split(patients, val_split, test_split)
+    if max_train_patients is not None and max_train_patients < len(train_p):
+        train_p = train_p[:max_train_patients]
+        print(f'  Data efficiency: capped train to {len(train_p)} patients', flush=True)
     print(f'  Patients — train:{len(train_p)}  val:{len(val_p)}  test:{len(test_p)}',
           flush=True)
 
@@ -232,7 +293,8 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
 
     def make_ds(split_patients, shuffle, repeat=False):
         ds = tf.data.Dataset.from_generator(
-            lambda p=split_patients: _hypo_gen(p), output_signature=sig
+            lambda p=split_patients: _hypo_gen(p, bedtime_only=bedtime_only),
+            output_signature=sig
         )
         if shuffle:
             ds = ds.shuffle(buffer_size=2_000, reshuffle_each_iteration=True)
@@ -241,15 +303,32 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
             ds = ds.repeat()
         return ds.prefetch(2)
 
-    print('  Scanning training labels (one pass)...', flush=True)
+    print('  Scanning labels (all splits)...', flush=True)
     label_batches = []
     for _, y in make_ds(train_p, shuffle=False):
         label_batches.append(y.numpy())
     steps_per_epoch = len(label_batches)
-    all_labels = np.concatenate(label_batches)
-    pos_rate = float(all_labels[:, 1].mean())   # delta column
-    print(f'  steps_per_epoch: {steps_per_epoch}  '
-          f'nocturnal_hypo_rate: {pos_rate:.3f}', flush=True)
+    train_labels = np.concatenate(label_batches)
+
+    val_labels  = np.concatenate([y.numpy() for _, y in make_ds(val_p,  shuffle=False)])
+    test_labels = np.concatenate([y.numpy() for _, y in make_ds(test_p, shuffle=False)])
+    all_labels  = np.concatenate([train_labels, val_labels, test_labels])
+
+    def _split_summary(labels, name):
+        n = len(labels); pos = int(labels[:, 1].sum())
+        print(f'    {name:<6} windows={n:>6}  hypos={pos:>4}  rate={pos/max(n,1):.3f}',
+              flush=True)
+        return n, pos
+
+    n_tr, p_tr = _split_summary(train_labels, 'train')
+    n_va, p_va = _split_summary(val_labels,   'val')
+    n_te, p_te = _split_summary(test_labels,  'test')
+    n_tot = n_tr + n_va + n_te; p_tot = p_tr + p_va + p_te
+    print(f'    {"TOTAL":<6} windows={n_tot:>6}  hypos={p_tot:>4}  rate={p_tot/max(n_tot,1):.3f}',
+          flush=True)
+
+    pos_rate = float(train_labels[:, 1].mean())   # delta column (train only, for loss)
+    print(f'  steps_per_epoch: {steps_per_epoch}', flush=True)
 
     return {
         'train':           make_ds(train_p, shuffle=True, repeat=True),
@@ -263,7 +342,7 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
     }
 
 
-def make_eval_hypo_dataset(patients, batch_size: int = 128):
+def make_eval_hypo_dataset(patients, batch_size: int = 128, bedtime_only: bool = False):
     """Fresh non-repeating hypo eval dataset — call per variant to avoid exhaustion."""
     import tensorflow as tf
     sig = (
@@ -271,7 +350,8 @@ def make_eval_hypo_dataset(patients, batch_size: int = 128):
         tf.TensorSpec((2,),             tf.float32),
     )
     ds = tf.data.Dataset.from_generator(
-        lambda p=patients: _hypo_gen(p), output_signature=sig
+        lambda p=patients: _hypo_gen(p, bedtime_only=bedtime_only),
+        output_signature=sig
     )
     return ds.batch(batch_size).prefetch(2)
 

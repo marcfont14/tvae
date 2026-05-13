@@ -14,7 +14,8 @@ Produces (in results/mtsm/{run_id}/):
   H_enrichment_scores.json                      PC1_L5, Σ|r_L5|, abstraction depth, sign flip
 
 Usage:
-  python scripts/analyse_H.py --run_id encoder --no_age
+  python scripts/analyse_H.py --run_id encoder2 --no_age
+  python scripts/analyse_H.py --run_id encoder3 --no_age --encoder3
 """
 
 import os
@@ -31,7 +32,7 @@ from sklearn.linear_model import Ridge
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.encoder import load_encoder
+from src.encoder import load_encoder, load_encoder3
 
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 gpus = tf.config.list_physical_devices('GPU')
@@ -41,6 +42,7 @@ if gpus:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 WINDOW_LEN  = 288
+PREFIX_LEN  = 144   # encoder3: steps 0–143 bidirectional, 144–287 causal
 N_FEATURES  = 11
 CGM_IDX     = 0
 PI_IDX      = 1
@@ -114,29 +116,43 @@ def build_transformer_encoder(window_len=WINDOW_LEN, n_features=10,
     return keras.Model(inp, x, name='TransformerEncoder')
 
 
-def build_layer_models(encoder, n_layers=N_LAYERS):
-    """Return a model per layer outputting H at that layer's output."""
-    models = []
-    inp = encoder.input
-    for i in range(n_layers):
-        out = encoder.get_layer(f'norm2_{i}').output
-        models.append(keras.Model(inp, out))
-    return models
-
-
-def _get_attention_single(encoder, window_np, layer_idx, d_model=D_MODEL):
-    """Compute attention weights for one window at a given layer. Returns (n_heads, 288, 288)."""
-    batch = tf.cast(window_np[np.newaxis], tf.float32)
-    mha_layer = encoder.get_layer(f'mhsa_{layer_idx}')
-    if layer_idx == 0:
-        # Input to block 0 = CLS token prepended to projected+PE sequence
-        cls_model = keras.Model(encoder.input, encoder.get_layer('cls_token').output)
-        q = tf.cast(cls_model(batch, training=False), tf.float32)  # (1, 289, d)
+def _layer_output_tensor(encoder, layer_idx, encoder3):
+    """Return the output tensor of block `layer_idx` for either architecture."""
+    if encoder3:
+        return encoder.get_layer(f'prefix_lm_{layer_idx}').output
     else:
-        prev_model = keras.Model(encoder.input, encoder.get_layer(f'norm2_{layer_idx-1}').output)
-        q = tf.cast(prev_model(batch, training=False), tf.float32)  # (1, 289, d)
-    _, attn = mha_layer(q, q, return_attention_scores=True, training=False)
-    return attn.numpy()[0, :, 1:, 1:]   # (n_heads, 288, 288) — drop CLS row/col
+        return encoder.get_layer(f'norm2_{layer_idx}').output
+
+
+def _strip_cls(H, encoder3):
+    """Drop CLS token (position 0) for encoder2; encoder3 has none."""
+    return H if encoder3 else H[:, 1:, :]
+
+
+def _get_attention_single(encoder, window_np, layer_idx, d_model=D_MODEL, encoder3=False):
+    """Compute attention weights for one window at a given layer.
+
+    Returns (n_heads, 288, 288). For encoder3 the prefix-LM mask is applied.
+    """
+    batch = tf.cast(window_np[np.newaxis], tf.float32)
+    if encoder3:
+        block   = encoder.get_layer(f'prefix_lm_{layer_idx}')
+        q_model = keras.Model(encoder.input, block.input)
+        q       = tf.cast(q_model(batch, training=False), tf.float32)  # (1, 288, d)
+        _, attn = block.mhsa(q, q, attention_mask=block._mask,
+                             return_attention_scores=True, training=False)
+        return attn.numpy()[0]   # (n_heads, 288, 288) — no CLS to drop
+    else:
+        mha_layer = encoder.get_layer(f'mhsa_{layer_idx}')
+        if layer_idx == 0:
+            cls_model = keras.Model(encoder.input, encoder.get_layer('cls_token').output)
+            q = tf.cast(cls_model(batch, training=False), tf.float32)  # (1, 289, d)
+        else:
+            prev_model = keras.Model(encoder.input,
+                                     encoder.get_layer(f'norm2_{layer_idx-1}').output)
+            q = tf.cast(prev_model(batch, training=False), tf.float32)  # (1, 289, d)
+        _, attn = mha_layer(q, q, return_attention_scores=True, training=False)
+        return attn.numpy()[0, :, 1:, 1:]   # (n_heads, 288, 288) — drop CLS row/col
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -151,8 +167,12 @@ def index_test_patients(data_dir, max_patients=None):
     valid = []
     for fname in npz_files:
         fpath = os.path.join(data_dir, fname)
-        d     = np.load(fpath, allow_pickle=True)
-        wins  = d['windows'].astype(np.float32)
+        try:
+            d     = np.load(fpath, allow_pickle=True)
+            wins  = d['windows'].astype(np.float32)
+        except Exception:
+            print(f"  [WARN] skipping corrupt file: {fname}")
+            continue
         bolus = wins[:, :, BOLUS_IDX]
         carbs = wins[:, :, CARBS_IDX]
         cgm   = wins[:, :, CGM_IDX]
@@ -178,8 +198,11 @@ def sample_windows(test_records, n_windows=1500, no_age=True):
 
     windows, modalities, ages = [], [], []
     for fpath, win_idx in records:
-        d   = np.load(fpath, allow_pickle=True)
-        win = d['windows'][win_idx].astype(np.float32)
+        try:
+            d   = np.load(fpath, allow_pickle=True)
+            win = d['windows'][win_idx].astype(np.float32)
+        except Exception:
+            continue
         windows.append(win)
         # Modality from one-hot (features 7-9)
         onehot = win[0, AID_IDX:MDI_IDX + 1]
@@ -196,19 +219,16 @@ def sample_windows(test_records, n_windows=1500, no_age=True):
 
 # ── H computation ─────────────────────────────────────────────────────────────
 
-def compute_H_per_layer(encoder, windows, n_layers=N_LAYERS, batch_size=64):
+def compute_H_per_layer(encoder, windows, n_layers=N_LAYERS, batch_size=64, encoder3=False):
     """Returns list of H arrays, one per layer, shape (N, 288, d_model)."""
     H_layers = [[] for _ in range(n_layers)]
     for i in range(n_layers):
-        layer_model = keras.Model(
-            encoder.input,
-            encoder.get_layer(f'norm2_{i}').output
-        )
+        layer_model = keras.Model(encoder.input, _layer_output_tensor(encoder, i, encoder3))
         for start in range(0, len(windows), batch_size):
             batch = tf.cast(windows[start:start + batch_size], tf.float32)
-            H_layers[i].append(layer_model(batch, training=False).numpy()[:, 1:, :])  # drop CLS
+            H = layer_model(batch, training=False).numpy()
+            H_layers[i].append(_strip_cls(H, encoder3))
     return [np.concatenate(h, axis=0) for h in H_layers]
-
 
 
 # ── Plot: attention case studies ──────────────────────────────────────────────
@@ -242,7 +262,14 @@ def _find_event_windows(windows, n_per_type=4):
     return selected
 
 
-def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3):
+def _add_prefix_boundary(ax, step, alpha=0.55):
+    """Draw the encoder3 prefix-LM boundary at step 144 on an attention heatmap."""
+    bd = PREFIX_LEN // step
+    ax.axvline(bd - 0.5, color='gold', lw=1.2, alpha=alpha, ls='-')
+    ax.axhline(bd - 0.5, color='gold', lw=1.2, alpha=alpha, ls='-')
+
+
+def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3, encoder3=False):
     """
     For representative windows (post-bolus, meal, hypo, stable): plot the raw
     CGM/PI/RA signal alongside the L5 mean-head attention heatmap so that the
@@ -287,6 +314,9 @@ def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3):
                 ax_s.axvline(t_full[bt], color=COLORS['bolus'], lw=0.9, alpha=0.7, ls='--')
             for ct in np.where(win[:, CARBS_IDX] > 0)[0]:
                 ax_s.axvline(t_full[ct], color=COLORS['carbs'], lw=0.9, alpha=0.7, ls=':')
+            if encoder3:
+                ax_s.axvline(PREFIX_LEN * 5 / 60, color='gold', lw=1.0, alpha=0.6,
+                             ls='-', label='prefix boundary')
             ax_s.set_xlabel('Time (h)', fontsize=9)
             ax_s.set_ylabel('z-score', fontsize=9)
             ax_s.legend(fontsize=8, loc='upper right')
@@ -296,7 +326,8 @@ def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3):
             # ── Attention heatmap ──────────────────────────────────────────────
             ax_a = axes[row, 1]
             try:
-                attn      = _get_attention_single(encoder, win, layer_idx=N_LAYERS - 1)
+                attn      = _get_attention_single(encoder, win, layer_idx=N_LAYERS - 1,
+                                                   encoder3=encoder3)
                 mean_attn = attn.mean(axis=0)           # (T, T): avg over heads
                 attn_down = mean_attn[::step, ::step]   # (n_down, n_down)
 
@@ -313,11 +344,17 @@ def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3):
                     ax_a.axvline(cd, color=COLORS['carbs'], lw=0.9, alpha=0.6, ls=':')
                     ax_a.axhline(cd, color=COLORS['carbs'], lw=0.9, alpha=0.6, ls=':')
 
+                if encoder3:
+                    _add_prefix_boundary(ax_a, step)
+
                 ax_a.set_xticks(tick_pos); ax_a.set_xticklabels(tick_labels, fontsize=8)
                 ax_a.set_yticks(tick_pos); ax_a.set_yticklabels(tick_labels, fontsize=8)
                 ax_a.set_xlabel('Key (time)', fontsize=9)
                 ax_a.set_ylabel('Query (time)', fontsize=9)
-                ax_a.set_title('Mean-head attention (L5)', fontsize=9)
+                title = 'Mean-head attention (L5)'
+                if encoder3:
+                    title += '  [gold = prefix boundary @ 12h]'
+                ax_a.set_title(title, fontsize=9)
             except Exception as e:
                 ax_a.set_title(f'Error: {e}', fontsize=8)
 
@@ -328,7 +365,7 @@ def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3):
         print(f"    Saved: {path}")
 
 
-def plot_attention_event_aligned(encoder, windows, results_dir):
+def plot_attention_event_aligned(encoder, windows, results_dir, encoder3=False):
     """
     For windows with a bolus or meal event at a known timestep, extract the
     attention row at that timestep and express it relative to the event (±8h).
@@ -359,7 +396,8 @@ def plot_attention_event_aligned(encoder, windows, results_dir):
                 continue
             t_ev = ev_times[len(ev_times) // 2]   # pick the middle event
             try:
-                attn = _get_attention_single(encoder, windows[i], layer_idx=N_LAYERS - 1)
+                attn = _get_attention_single(encoder, windows[i], layer_idx=N_LAYERS - 1,
+                                             encoder3=encoder3)
                 row  = attn.mean(axis=0)[t_ev]                          # (T,)
                 row  = row[t_ev - EVENT_HALF: t_ev + EVENT_HALF]        # (2*EVENT_HALF,)
                 profiles.append(row[::step])
@@ -369,7 +407,6 @@ def plot_attention_event_aligned(encoder, windows, results_dir):
         if profiles:
             profiles = np.array(profiles)
             mean_p   = profiles.mean(axis=0)
-            std_p    = profiles.std(axis=0)
             mean_p  /= mean_p.sum() + 1e-8   # normalise so area = 1
 
             ax.plot(t_rel_down, mean_p, color=color, lw=2)
@@ -389,8 +426,6 @@ def plot_attention_event_aligned(encoder, windows, results_dir):
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"    Saved: {path}")
-
-
 
 
 # ── Plot: PCA by modality (L5) ────────────────────────────────────────────────
@@ -422,8 +457,6 @@ def plot_pca_by_modality(H_L5, modalities, results_dir):
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"    Saved: {path}")
-
-
 
 
 # ── Plot: feature correlation per layer ───────────────────────────────────────
@@ -466,8 +499,6 @@ def plot_feature_corr_per_layer(H_layers, windows, n_layers, results_dir):
     return corr_matrix
 
 
-
-
 # ── Plot: event-triggered H norm ─────────────────────────────────────────────
 
 def _event_triggered_norm(norms, event_mask, win=EVENT_WINDOW):
@@ -483,11 +514,9 @@ def _event_triggered_norm(norms, event_mask, win=EVENT_WINDOW):
     return arr.mean(axis=0), len(traces)
 
 
-def plot_H_norm_vs_drivers(encoder, windows, results_dir):
+def plot_H_norm_vs_drivers(H_L5, windows, results_dir):
+    """H_L5: (N, 288, d_model) — precomputed from compute_H_per_layer (CLS already stripped)."""
     print("  [7/8] Event-triggered H norm at L5...")
-    H_L5  = keras.Model(encoder.input, encoder.get_layer('norm2_4').output)(
-        tf.cast(windows, tf.float32), training=False
-    ).numpy()[:, 1:, :]  # drop CLS
     norms = np.linalg.norm(H_L5, axis=-1)
 
     bolus_mask = windows[:, :, BOLUS_IDX] > 0
@@ -517,8 +546,6 @@ def plot_H_norm_vs_drivers(encoder, windows, results_dir):
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"    Saved: {path}")
-
-
 
 
 # ── Plot: circadian H norm ─────────────────────────────────────────────────────
@@ -565,19 +592,15 @@ def plot_H_circadian(H_norms, windows, results_dir):
     print(f"    Saved: {path}")
 
 
-
-
 # ── Plot: abstraction trajectory ──────────────────────────────────────────────
 
-def plot_abstraction_trajectory(encoder, windows, n_layers, results_dir):
+def plot_abstraction_trajectory(H_layers, windows, n_layers, results_dir):
+    """H_layers: list of (N, 288, d_model) arrays — precomputed from compute_H_per_layer."""
     from sklearn.decomposition import PCA
     print("  Abstraction trajectory (PC1 + probe R² across layers)...")
 
     pc1s, r2s = [], []
-    for i in range(n_layers):
-        H = keras.Model(encoder.input, encoder.get_layer(f'norm2_{i}').output)(
-            tf.cast(windows, tf.float32), training=False
-        ).numpy()[:, 1:, :]  # drop CLS
+    for i, H in enumerate(H_layers):
         h_pool = H.mean(axis=1)
         pc1s.append(PCA(n_components=1).fit(h_pool).explained_variance_ratio_[0] * 100)
 
@@ -671,11 +694,15 @@ def main(args):
 
     n_features = 10 if args.no_age else N_FEATURES
 
-    print(f"\n── analyse_H.py  run={args.run_id} ──────────────────────────────")
+    arch_tag = 'encoder3 (PrefixLM)' if args.encoder3 else 'encoder2 (CLS)'
+    print(f"\n── analyse_H.py  run={args.run_id}  arch={arch_tag} ──────────────────")
 
-    # Build + load encoder (encoder2: CLS token architecture)
-    encoder = load_encoder(weights_path=enc_path, trainable=False,
-                           n_features=n_features)
+    if args.encoder3:
+        encoder = load_encoder3(weights_path=enc_path, trainable=False,
+                                n_features=n_features)
+    else:
+        encoder = load_encoder(weights_path=enc_path, trainable=False,
+                               n_features=n_features)
     print(f"  Encoder loaded: {enc_path}")
 
     # Load test windows
@@ -688,17 +715,19 @@ def main(args):
 
     # Compute H at all layers
     print("\n  Computing H per layer...")
-    H_layers = compute_H_per_layer(encoder, windows)
+    H_layers = compute_H_per_layer(encoder, windows, encoder3=args.encoder3)
 
     # Plots
-    plot_attention_case_studies(encoder, windows, results_dir)       # attention_{cat}.png (×4)
-    plot_attention_event_aligned(encoder, windows, results_dir)      # attention_event_aligned.png
+    plot_attention_case_studies(encoder, windows, results_dir,
+                                encoder3=args.encoder3)              # attention_{cat}.png (×4)
+    plot_attention_event_aligned(encoder, windows, results_dir,
+                                 encoder3=args.encoder3)             # attention_event_aligned.png
     plot_pca_by_modality(H_layers[-1], modalities, results_dir)      # pca_by_modality.png
-    corr_matrix = plot_feature_corr_per_layer(H_layers, windows, N_LAYERS, results_dir)  # feature_corr_per_layer.png
-    plot_H_norm_vs_drivers(encoder, windows, results_dir)            # H_norm_vs_drivers.png
+    corr_matrix = plot_feature_corr_per_layer(H_layers, windows, N_LAYERS, results_dir)
+    plot_H_norm_vs_drivers(H_layers[-1], windows, results_dir)        # H_norm_vs_drivers.png
     H_norms_L5 = np.linalg.norm(H_layers[-1], axis=-1)
     plot_H_circadian(H_norms_L5, windows, results_dir)               # H_norm_circadian.png
-    pc1_vals, r2s = plot_abstraction_trajectory(encoder, windows, N_LAYERS, results_dir)  # abstraction_trajectory.png
+    pc1_vals, r2s = plot_abstraction_trajectory(H_layers, windows, N_LAYERS, results_dir)
 
     save_enrichment_scores(pc1_vals, r2s, corr_matrix, results_dir)
 
@@ -711,5 +740,7 @@ if __name__ == '__main__':
     parser.add_argument('--data',      type=str, default='data/processed/adults')
     parser.add_argument('--no_age',    action='store_true', default=False)
     parser.add_argument('--n_windows', type=int, default=1500)
+    parser.add_argument('--encoder3',  action='store_true', default=False,
+                        help='Use encoder3 (PrefixLM, no CLS) instead of encoder2')
     args = parser.parse_args()
     main(args)

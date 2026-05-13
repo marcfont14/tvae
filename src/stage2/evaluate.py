@@ -3,7 +3,8 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, roc_auc_score, average_precision_score
-from sklearn.metrics import roc_curve, precision_recall_curve
+from sklearn.metrics import roc_curve, precision_recall_curve, brier_score_loss
+from sklearn.calibration import calibration_curve
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -255,7 +256,7 @@ def plot_forecast_traces(samples: list, models: dict, path: str,
     }
 
     t_ctx = np.arange(-context_steps + 1, 1) * 5   # -55 … 0 min
-    t_fut = np.arange(1, 7) * 5                     # 5 … 30 min
+    t_fut = np.arange(1, 25) * 5                    # 5 … 120 min
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows))
     axes_flat  = np.array(axes).flatten()
@@ -294,28 +295,105 @@ def plot_forecast_traces(samples: list, models: dict, path: str,
 
 
 def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """AUROC, AUPRC, sensitivity@90spec and optimal-F1 for binary classification."""
+    """
+    Classification metrics for binary risk prediction.
+    Includes ranking (AUROC, AUPRC), calibration (Brier), and operating-point
+    metrics at both 90% and 95% specificity plus the optimal-F1 threshold.
+    """
     auroc = float(roc_auc_score(y_true, y_pred))
     auprc = float(average_precision_score(y_true, y_pred))
+    if y_pred.min() >= 0.0 and y_pred.max() <= 1.0:
+        brier = float(brier_score_loss(y_true, y_pred))
+    else:
+        brier = float('nan')  # not a probability (e.g. naive raw-score baseline)
 
     fpr, tpr, _ = roc_curve(y_true, y_pred)
-    # Sensitivity at the threshold where specificity >= 0.90
     spec = 1.0 - fpr
-    idx  = np.searchsorted(spec[::-1], 0.90)
-    sens_at_90spec = float(tpr[::-1][min(idx, len(tpr) - 1)])
+
+    def _sens_at_spec(target_spec):
+        idx = np.searchsorted(spec[::-1], target_spec)
+        return float(tpr[::-1][min(idx, len(tpr) - 1)])
+
+    sens_at_90spec = _sens_at_spec(0.90)
+    sens_at_95spec = _sens_at_spec(0.95)
 
     prec, rec, thresh_pr = precision_recall_curve(y_true, y_pred)
-    f1  = 2 * prec * rec / (prec + rec + 1e-8)
+    f1   = 2 * prec * rec / (prec + rec + 1e-8)
     best = int(np.argmax(f1))
+    ppv_optimal = float(prec[best])
+    nna_optimal = float(1.0 / max(prec[best], 1e-6))   # number needed to alarm
 
     return {
         'auroc':             auroc,
         'auprc':             auprc,
+        'brier':             brier,
         'prevalence':        float(y_true.mean()),
         'sens_at_90spec':    sens_at_90spec,
+        'sens_at_95spec':    sens_at_95spec,
+        'ppv_optimal':       ppv_optimal,
+        'nna_optimal':       nna_optimal,
         'f1_optimal':        float(f1[best]),
         'threshold_optimal': float(thresh_pr[best]) if best < len(thresh_pr) else 0.5,
     }
+
+
+def stratified_auroc(y_true: np.ndarray, y_pred: np.ndarray,
+                     last_cgm_z: np.ndarray, threshold: float = 0.0) -> dict:
+    """
+    AUROC split by last observed CGM z-score.
+
+    "Hard" cases (last_cgm_z > threshold): current glucose is normal/high — the
+    naive last-value baseline predicts low risk here, so only models that have
+    learned trajectory and driver dynamics can do well.
+
+    "Easy" cases (last_cgm_z <= threshold): glucose is already low — all models
+    (including naive) should detect these.
+    """
+    results = {}
+    for name, mask in [('hard', last_cgm_z > threshold),
+                       ('easy', last_cgm_z <= threshold)]:
+        n_pos = int(y_true[mask].sum())
+        n_neg = int((~y_true[mask].astype(bool)).sum())
+        if n_pos < 5 or n_neg < 5:
+            continue
+        try:
+            results[f'auroc_{name}'] = float(roc_auc_score(y_true[mask], y_pred[mask]))
+            results[f'auprc_{name}'] = float(average_precision_score(y_true[mask], y_pred[mask]))
+            results[f'n_{name}']     = int(mask.sum())
+            results[f'prev_{name}']  = float(y_true[mask].mean())
+        except Exception:
+            pass
+    return results
+
+
+def plot_calibration(all_preds: dict, path: str) -> None:
+    """
+    Reliability diagram (calibration curve) for all variants except naive.
+    Naive scores are not probabilities so cannot be calibrated.
+    A perfectly calibrated model lies on the diagonal.
+    """
+    fig, ax = plt.subplots(figsize=(5, 5))
+    _colors = {'raw_lstm': '#2ca02c', 'fm_lstm': '#1f77b4',
+               'fm_ft_lstm': '#ff7f0e', 'fm_decoder_lstm': '#9467bd',
+               'fm_decoder_ft_lstm': '#d62728'}
+    for tag, (yt, yp) in all_preds.items():
+        if tag == 'naive':
+            continue
+        try:
+            frac_pos, mean_pred = calibration_curve(yt, yp, n_bins=10, strategy='quantile')
+            ax.plot(mean_pred, frac_pos, marker='o', linewidth=1.5,
+                    color=_colors.get(tag, 'grey'), label=tag)
+        except Exception:
+            pass
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=0.8, alpha=0.5, label='Perfect')
+    ax.set_xlabel('Mean predicted risk')
+    ax.set_ylabel('Fraction of positives')
+    ax.set_title('Calibration — Hypo Risk')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
 
 
 def plot_roc_curves(all_preds: dict, path: str) -> None:
@@ -695,13 +773,13 @@ def save_imputation_table(all_gap_metrics: dict, gap_labels: list, path: str) ->
 
 
 def save_comparison_table(all_metrics: dict, path: str) -> None:
-    """Save model-level comparison as CSV (one row per model, h0=t+5 and h5=t+30)."""
+    """Save model-level comparison as CSV (one row per model, h0=t+5 and h23=t+120)."""
     cols = ['model',
-            'R2_t5', 'R2_t30',
-            'RMSE_t5', 'RMSE_t30',
-            'MAE_t5',  'MAE_t30',
+            'R2_t5', 'R2_t120',
+            'RMSE_t5', 'RMSE_t120',
+            'MAE_t5',  'MAE_t120',
             'MARD_t5', 'within15_t5',
-            'Clarke_A_t5', 'Clarke_A_t30',
+            'Clarke_A_t5', 'Clarke_A_t120',
             'bias_t5',
             'epochs', 'time_min']
 
@@ -712,20 +790,20 @@ def save_comparison_table(all_metrics: dict, path: str) -> None:
     rows = []
     for tag, m in all_metrics.items():
         rows.append({
-            'model':         tag,
-            'R2_t5':         _f(m, 'R2_h0'),
-            'R2_t30':        _f(m, 'R2_h5'),
-            'RMSE_t5':       _f(m, 'RMSE_h0', '.2f'),
-            'RMSE_t30':      _f(m, 'RMSE_h5', '.2f'),
-            'MAE_t5':        _f(m, 'MAE_h0',  '.2f'),
-            'MAE_t30':       _f(m, 'MAE_h5',  '.2f'),
-            'MARD_t5':       _f(m, 'MARD_h0', '.2f'),
-            'within15_t5':   _f(m, 'within15_h0', '.2f'),
-            'Clarke_A_t5':   _f(m, 'Clarke_5min_A'),
-            'Clarke_A_t30':  _f(m, 'Clarke_30min_A'),
-            'bias_t5':       _f(m, 'mean_error_h0', '.2f'),
-            'epochs':        str(int(m['epochs_trained'])) if 'epochs_trained' in m else '-',
-            'time_min':      _f(m, 'train_time_min', '.1f') if 'train_time_min' in m else '-',
+            'model':          tag,
+            'R2_t5':          _f(m, 'R2_h0'),
+            'R2_t120':        _f(m, 'R2_h23'),
+            'RMSE_t5':        _f(m, 'RMSE_h0',  '.2f'),
+            'RMSE_t120':      _f(m, 'RMSE_h23', '.2f'),
+            'MAE_t5':         _f(m, 'MAE_h0',   '.2f'),
+            'MAE_t120':       _f(m, 'MAE_h23',  '.2f'),
+            'MARD_t5':        _f(m, 'MARD_h0',  '.2f'),
+            'within15_t5':    _f(m, 'within15_h0', '.2f'),
+            'Clarke_A_t5':    _f(m, 'Clarke_5min_A'),
+            'Clarke_A_t120':  _f(m, 'Clarke_120min_A'),
+            'bias_t5':        _f(m, 'mean_error_h0', '.2f'),
+            'epochs':         str(int(m['epochs_trained'])) if 'epochs_trained' in m else '-',
+            'time_min':       _f(m, 'train_time_min', '.1f') if 'train_time_min' in m else '-',
         })
 
     with open(path, 'w', newline='') as f:

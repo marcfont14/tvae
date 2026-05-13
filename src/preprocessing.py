@@ -278,15 +278,26 @@ def add_modality_onehot(df: pl.DataFrame) -> pl.DataFrame:
 
 # ── 7. Normalisation ──────────────────────────────────────────────────────────
 
-def normalise_patient(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
+def normalise_patient(
+    df: pl.DataFrame,
+    global_cgm_mean: float | None = None,
+    global_cgm_std:  float | None = None,
+) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
     """
-    Z-score normalise CGM, PI, RA per patient.
+    Z-score normalise CGM, PI, RA.
+    CGM: uses global_cgm_mean/std if provided (preserves between-patient differences);
+         falls back to per-patient z-score otherwise.
+    PI, RA: always per-patient z-scored.
     Returns normalised df and scaler parameters (mean, std) for [CGM, PI, RA].
     """
     cols = ['CGM', 'PI', 'RA']
     means = np.array([df[c].mean() for c in cols], dtype=np.float32)
     stds  = np.array([df[c].std()  for c in cols], dtype=np.float32)
-    stds  = np.where(stds == 0, 1.0, stds)  # avoid division by zero
+    stds  = np.where(stds == 0, 1.0, stds)
+
+    if global_cgm_mean is not None and global_cgm_std is not None:
+        means[0] = global_cgm_mean
+        stds[0]  = global_cgm_std
 
     df = df.with_columns([
         ((pl.col(c) - float(means[i])) / float(stds[i])).alias(c)
@@ -358,15 +369,23 @@ def save_patient(
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def run_preprocessing(cfg: Settings | None = None) -> None:
+def run_preprocessing(cfg: Settings | None = None,
+                      global_scaler_path: str | None = None) -> None:
     """
     Full preprocessing pipeline. Streams through the parquet patient by patient.
+    Pass global_scaler_path to use a global CGM mean/std instead of per-patient.
     """
     if cfg is None:
         cfg = Settings()
 
     input_path  = cfg.paths.combined_parquet
     output_dir  = cfg.paths.data_processed
+
+    global_cgm_mean, global_cgm_std = None, None
+    if global_scaler_path:
+        gs = np.load(global_scaler_path)
+        global_cgm_mean, global_cgm_std = float(gs[0]), float(gs[1])
+        print(f'Global CGM scaler: mean={global_cgm_mean:.2f}  std={global_cgm_std:.2f}')
 
     print(f"Input:  {input_path}")
     print(f"Output: {output_dir}")
@@ -407,7 +426,7 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
         )
 
         # 7. Normalise
-        df_pd, means, stds = normalise_patient(df_pd)
+        df_pd, means, stds = normalise_patient(df_pd, global_cgm_mean, global_cgm_std)
 
         # 8. Windows
         windows = extract_windows(df_pd, cfg)
@@ -463,9 +482,11 @@ def run_preprocessing(cfg: Settings | None = None) -> None:
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output-dir', type=str, default=None)
-    parser.add_argument('--min-age',    type=float, default=None)
-    parser.add_argument('--max-age',    type=float, default=None)
+    parser.add_argument('--output-dir',     type=str,   default=None)
+    parser.add_argument('--min-age',        type=float, default=None)
+    parser.add_argument('--max-age',        type=float, default=None)
+    parser.add_argument('--global-scaler',  type=str,   default=None,
+                        help='Path to .npy file with [global_cgm_mean, global_cgm_std]')
     args = parser.parse_args()
 
     cfg = Settings()
@@ -475,4 +496,4 @@ if __name__ == '__main__':
         cfg.preprocessing.min_age = args.min_age
     if args.max_age is not None:
         cfg.preprocessing.max_age = args.max_age
-    run_preprocessing(cfg)
+    run_preprocessing(cfg, global_scaler_path=args.global_scaler)

@@ -34,7 +34,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 
-from src.encoder import build_encoder, load_encoder
+from src.encoder import build_encoder, load_encoder, build_encoder3, load_encoder3
 
 SEED     = 42
 IDX_CGM  = 0
@@ -135,16 +135,17 @@ def alignment(h, patient_ids, n_pairs=2000):
     return float(np.mean(intra)), float(np.mean(inter))
 
 
-# ── h_cls extraction ──────────────────────────────────────────────────────────
+# ── global summary extraction ─────────────────────────────────────────────────
 
 def get_h_cls(encoder, windows, batch=128):
-    """encoder returns [H, h_cls]; return h_cls only."""
+    """encoder returns [H, h_cls/h_last]; return the global summary vector."""
     return encoder.predict(windows, batch_size=batch, verbose=0)[1]
 
 
 # ── PCA analysis ─────────────────────────────────────────────────────────────
 
-def pca_analysis(h_trained, h_random, therapy, mean_cgm, hour, path, json_out):
+def pca_analysis(h_trained, h_random, therapy, mean_cgm, hour, path, json_out,
+                 enc_tag='Trained encoder2'):
     """
     3-row figure:
       Row 0 — trained encoder PC1 vs PC2 (3 colorings)
@@ -203,8 +204,8 @@ def pca_analysis(h_trained, h_random, therapy, mean_cgm, hour, path, json_out):
     fig = plt.figure(figsize=(16, 14))
     gs  = fig.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
 
-    for row_idx, (pc, tag, ev) in enumerate([(pc_t, 'Trained encoder2', ev_t),
-                                              (pc_r, 'Random init',      ev_r)]):
+    for row_idx, (pc, tag, ev) in enumerate([(pc_t, enc_tag, ev_t),
+                                              (pc_r, 'Random init', ev_r)]):
         # Therapy type
         ax = fig.add_subplot(gs[row_idx, 0])
         for t, (col, lbl) in enumerate(zip(COLORS, LABELS)):
@@ -270,7 +271,7 @@ def pca_analysis(h_trained, h_random, therapy, mean_cgm, hour, path, json_out):
                 ax_c.text(j, i, f'{mat[i,j]:.2f}', ha='center', va='center',
                           fontsize=7, color='white' if mat[i,j] > 0.5 else 'black')
 
-    fig.suptitle('Encoder h_cls — PCA', fontsize=13)
+    fig.suptitle(f'{enc_tag} — PCA', fontsize=13)
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'  Saved: {path}')
@@ -312,16 +313,17 @@ def reduce_2d(h):
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
 
-def plot_embeddings(emb_t, emb_r, therapy, mean_cgm, hour, method, path):
+def plot_embeddings(emb_t, emb_r, therapy, mean_cgm, hour, method, path,
+                    enc_tag='Trained encoder2'):
     """2 rows (trained / random) × 3 cols (therapy / mean CGM / time of day)."""
     COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c']
     LABELS = ['AID', 'SAP', 'MDI']
     S      = 4
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle(f'Encoder h_cls — {method} projection', fontsize=13)
+    fig.suptitle(f'{enc_tag} — {method} projection', fontsize=13)
 
-    for row, (emb, tag) in enumerate([(emb_t, 'Trained encoder2'),
+    for row, (emb, tag) in enumerate([(emb_t, enc_tag),
                                        (emb_r, 'Random init')]):
         # Therapy type
         ax = axes[row, 0]
@@ -376,15 +378,26 @@ def main(args):
     )
     print(f'  Windows: {len(windows):,}   Patients: {pids.max()+1}')
 
-    # 2. h_cls — trained
-    print('\n  Extracting h_cls — trained encoder ...')
-    enc_trained = load_encoder(weights_path=args.weights, trainable=False)
-    h_trained   = get_h_cls(enc_trained, windows)
+    # 2. global summary — trained
+    if args.encoder3:
+        enc_tag = 'Trained encoder3 (h_last)'
+        print('\n  Extracting h_last — trained encoder3 ...')
+        enc_trained = load_encoder3(weights_path=args.weights, trainable=False)
+        print('  Building random encoder3 for baseline ...')
+        enc_random  = build_encoder3()
+        enc_random(tf.zeros((1, 288, 10)))
+    else:
+        enc_tag = 'Trained encoder2 (h_cls)'
+        print('\n  Extracting h_cls — trained encoder2 ...')
+        enc_trained = load_encoder(weights_path=args.weights, trainable=False)
+        print('  Building random encoder2 for baseline ...')
+        enc_random  = build_encoder()
+        enc_random(tf.zeros((1, 288, 10)))
 
-    # 3. h_cls — random init
-    print('  Extracting h_cls — random encoder ...')
-    enc_random = build_encoder()
-    enc_random(tf.zeros((1, 288, 10)))
+    h_trained = get_h_cls(enc_trained, windows)
+
+    # 3. global summary — random init
+    print('  Extracting global summary — random encoder ...')
     enc_random.trainable = False
     h_random = get_h_cls(enc_random, windows)
 
@@ -413,6 +426,7 @@ def main(args):
         h_trained, h_random, therapy, mean_cgm, hour,
         os.path.join(args.out, 'pca_analysis.png'),
         os.path.join(args.out, 'pca_analysis.json'),
+        enc_tag=enc_tag,
     )
 
     # 8. 2D projection (subsample for speed)
@@ -422,7 +436,8 @@ def main(args):
     emb_t, method = reduce_2d(h_trained[sel])
     emb_r, _      = reduce_2d(h_random[sel])
     plot_embeddings(emb_t, emb_r, therapy[sel], mean_cgm[sel], hour[sel],
-                    method, os.path.join(args.out, 'embedding_analysis.png'))
+                    method, os.path.join(args.out, 'embedding_analysis.png'),
+                    enc_tag=enc_tag)
 
     # 9. Save JSON
     summary = {
@@ -468,5 +483,7 @@ if __name__ == '__main__':
                         help='Max windows per patient')
     parser.add_argument('--n_plot',          type=int, default=2000,
                         help='Windows to subsample for 2D projection')
+    parser.add_argument('--encoder3',        action='store_true', default=False,
+                        help='Use encoder3 (PrefixLM, h_last) instead of encoder2')
     args = parser.parse_args()
     main(args)
