@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score, roc_auc_score, average_precision_score
 from sklearn.metrics import roc_curve, precision_recall_curve, brier_score_loss
+from sklearn.metrics import matthews_corrcoef
 from sklearn.calibration import calibration_curve
 
 
@@ -323,6 +324,12 @@ def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     ppv_optimal = float(prec[best])
     nna_optimal = float(1.0 / max(prec[best], 1e-6))   # number needed to alarm
 
+    if best < len(thresh_pr):
+        y_pred_binary = (y_pred >= thresh_pr[best]).astype(int)
+        mcc_optimal = float(matthews_corrcoef(y_true, y_pred_binary))
+    else:
+        mcc_optimal = float('nan')
+
     return {
         'auroc':             auroc,
         'auprc':             auprc,
@@ -333,6 +340,7 @@ def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         'ppv_optimal':       ppv_optimal,
         'nna_optimal':       nna_optimal,
         'f1_optimal':        float(f1[best]),
+        'mcc_optimal':       mcc_optimal,
         'threshold_optimal': float(thresh_pr[best]) if best < len(thresh_pr) else 0.5,
     }
 
@@ -438,7 +446,7 @@ def plot_pr_curves(all_preds: dict, prevalence: float, path: str) -> None:
 
 
 def save_classification_table(all_metrics: dict, path: str) -> None:
-    cols = ['model', 'auroc', 'auprc', 'sens_at_90spec', 'f1_optimal',
+    cols = ['model', 'auroc', 'auprc', 'sens_at_90spec', 'f1_optimal', 'mcc_optimal',
             'prevalence', 'epochs', 'time_min']
     rows = []
     for tag, m in all_metrics.items():
@@ -448,6 +456,7 @@ def save_classification_table(all_metrics: dict, path: str) -> None:
             'auprc':          f"{m.get('auprc', float('nan')):.4f}",
             'sens_at_90spec': f"{m.get('sens_at_90spec', float('nan')):.4f}",
             'f1_optimal':     f"{m.get('f1_optimal', float('nan')):.4f}",
+            'mcc_optimal':    f"{m.get('mcc_optimal', float('nan')):.4f}",
             'prevalence':     f"{m.get('prevalence', float('nan')):.4f}",
             'epochs':         str(int(m['epochs_trained'])) if 'epochs_trained' in m else '-',
             'time_min':       f"{m['train_time_min']:.1f}" if 'train_time_min' in m else '-',

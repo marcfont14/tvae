@@ -58,7 +58,7 @@ THERAPY_LABELS = ['AID', 'SAP', 'MDI']
 SEED = 42
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-EMB_DIR  = 'results/embedding_study'
+EMB_DIR  = 'results/embedding_study_global_norm'
 OUT_DIR  = os.path.join(EMB_DIR, 'plots_paper')
 os.makedirs(OUT_DIR, exist_ok=True)
 

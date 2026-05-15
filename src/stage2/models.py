@@ -285,55 +285,61 @@ def predict_ar_decoder(encoder: keras.Model, ntp_head: keras.Model,
     return preds_mg
 
 
-# ── Hypo risk — Weibull survival head ────────────────────────────────────────
+# ── Hypo risk — binary classification head ───────────────────────────────────
 
 def build_hypo_risk_decoder(encoder: keras.Model,
                             d_model: int = D_MODEL) -> keras.Model:
-    """
-    Nocturnal hypo-risk model using h_last from causal decoder.
-    Identical structure to build_hypo_risk_model — only the encoder source differs.
-    """
+    """Bedtime hypo-risk using h_last from causal decoder → P(hypo in 8h)."""
     x = keras.Input(shape=(288, 10), name='window')
     H, h_last = encoder(x)
     h   = layers.Dense(64, activation='relu', name='head_dense')(h_last)
-    out = layers.Dense(2, name='weibull_params')(h)
+    out = layers.Dense(1, activation='sigmoid', name='hypo_prob')(h)
     return keras.Model(x, out, name='HypoRiskDecoder')
 
 
 def build_raw_hypo_risk_model(d_model: int = D_MODEL) -> keras.Model:
     """
     Raw hypo-risk baseline — no encoder.
-    Window (288, 10) → Conv1D(stride=4) → (72, 128) → LSTM(128) → Dense(64) → [log_λ, log_k].
-    Mirrors build_raw_forecasting_lstm structure for consistency.
+    Window (288,10) → Conv1D(stride=4) → LSTM(128) → Dense(64) → P(hypo in 8h).
     """
     x = keras.Input(shape=(288, 10), name='window')
     z = layers.Conv1D(d_model, kernel_size=4, strides=4, padding='same',
                       activation='relu', name='downsample')(x)        # (B, 72, 128)
     h = layers.LSTM(d_model, return_sequences=False, unroll=True, name='enc_lstm')(z)
     h = layers.Dense(64, activation='relu', name='head_dense')(h)
-    out = layers.Dense(2, name='weibull_params')(h)
+    out = layers.Dense(1, activation='sigmoid', name='hypo_prob')(h)
     return keras.Model(x, out, name='RawHypoRisk')
 
 
 def build_hypo_risk_model(encoder: keras.Model,
                           d_model: int = D_MODEL) -> keras.Model:
     """
-    FM nocturnal hypo-risk model (frozen or fine-tuned encoder).
-      H, _ = encoder(window)
-      AttentionPool(H) → FC(64) → [log_lambda, log_k]  (Weibull survival params)
-    Encoder trainability set by caller (trainable=False → frozen, True → fine-tuned).
+    FM bedtime hypo-risk (frozen or fine-tuned encoder).
+      AttentionPool(H) → Dense(64) → P(hypo in 8h)
     """
     x = keras.Input(shape=(288, 10), name='window')
     H, _ = encoder(x)
     h = AttentionPool(d_model, name='attn_pool')(H)
     h = layers.Dense(64, activation='relu', name='head_dense')(h)
-    out = layers.Dense(2, name='weibull_params')(h)                   # [log_lambda, log_k]
+    out = layers.Dense(1, activation='sigmoid', name='hypo_prob')(h)
     return keras.Model(x, out, name='HypoRiskModel')
 
 
 # ── Imputation — zero-shot MTSM reconstruction ───────────────────────────────
 
-MTSM_MODEL_WEIGHTS = 'results/mtsm/encoder2/model_weights.weights.h5'
+MTSM_MODEL_WEIGHTS = 'results/mtsm/encoder_global_norm/model_weights.weights.h5'
+
+# Must match experiment_mtsm.py constants
+_K_BINS    = 200
+_BIN_Z_MIN = (40.0  - 144.40) / 57.11   # ≈ -1.828
+_BIN_Z_MAX = (400.0 - 144.40) / 57.11   # ≈ +4.474
+
+# Bin centres as a (1, 1, K) constant for soft decoding
+_BIN_CENTERS = tf.constant(
+    [(_BIN_Z_MIN + (_BIN_Z_MAX - _BIN_Z_MIN) * (k + 0.5) / _K_BINS)
+     for k in range(_K_BINS)],
+    dtype=tf.float32,
+)[tf.newaxis, tf.newaxis, :]   # (1, 1, K)
 
 
 def build_raw_imputation_model() -> keras.Model:
@@ -357,14 +363,23 @@ def build_mtsm_imputation_model(
     Rebuild full MTSM model (encoder + reconstruction head) and load pre-trained
     weights. Used for zero-shot imputation — no task-specific training.
     Input: window with CGM masked to 0 in gap → output: full (288,) CGM reconstruction.
+
+    The pre-training head outputs K=200 bin logits. We decode via softmax-weighted
+    bin-centre sum (soft argmax) to recover a continuous z-score.
     """
     from src.encoder import build_encoder, WINDOW_LEN, N_FEATURES
     enc = build_encoder()
     x   = keras.Input(shape=(WINDOW_LEN, N_FEATURES), name='input')
-    H, h_cls = enc(x)                                                  # unpack
+    H, h_cls = enc(x)
     out = layers.Dense(64, activation='relu', name='recon_hidden')(H)
-    out = layers.Dense(1,  name='reconstruction_head')(out)
-    out = layers.Reshape((WINDOW_LEN,), name='output')(out)
+    out = layers.Dense(_K_BINS, name='reconstruction_head')(out)       # (B, T, 200)
+    # Soft argmax: weighted sum of bin centres → continuous z-score (B, T)
+    out = layers.Lambda(
+        lambda logits: tf.reduce_sum(
+            tf.nn.softmax(logits, axis=-1) * _BIN_CENTERS, axis=-1
+        ),
+        name='output',
+    )(out)
     model = keras.Model(x, out, name='MTSM')
     model(tf.zeros((1, WINDOW_LEN, N_FEATURES)))
     model.load_weights(weights_path)

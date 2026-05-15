@@ -222,21 +222,14 @@ def make_eval_dataset(patients, batch_size: int = 128):
     return ds.batch(batch_size).prefetch(2)
 
 
-def _hypo_gen(patients, bedtime_only: bool = False):
+def _hypo_gen(patients):
     """
-    Yields (window (288,10), label (2,)) for nocturnal hypo-risk (Weibull survival).
+    Yields (window (288,10), label scalar float32) for bedtime binary hypo-risk.
 
-    bedtime_only=False (default):
-      Nocturnal filter — horizon starts between 22:00 and 06:00; HYPO_AHEAD=24 (2h).
-    bedtime_only=True:
-      Bedtime filter — horizon starts between 20:00 and 23:59; HYPO_AHEAD_NOCTURNAL=96
-      (8h). Covers the full nocturnal period from bedtime to morning.
-
-    Label = [time_to_event, delta] where:
-      time_to_event: first step (1-indexed) where CGM < 70 mg/dL, or ahead if none
-      delta:         1.0 if hypo observed, 0.0 if censored
+    Filter: input window ends between 21:00 and 23:59 (hours 21, 22, 23).
+    Label:  1.0 if any CGM < 70 mg/dL in the next HYPO_AHEAD_NOCTURNAL steps (8h),
+            0.0 otherwise.
     """
-    ahead = HYPO_AHEAD_NOCTURNAL if bedtime_only else HYPO_AHEAD
     for path, no_age in patients:
         try:
             windows, mean, std = load_patient(path, no_age)
@@ -248,34 +241,24 @@ def _hypo_gen(patients, bedtime_only: bool = False):
                           - float(windows[i + LOOKAHEAD, 0, IDX_CGM]))
             if delta_z > CONTIGUITY_THRESHOLD:
                 continue
-            hsin = float(windows[i + LOOKAHEAD, 0, IDX_HSIN])
-            hcos = float(windows[i + LOOKAHEAD, 0, IDX_HCOS])
+            # filter on last step of INPUT window (bedtime = 21:00–23:59)
+            hsin = float(windows[i, -1, IDX_HSIN])
+            hcos = float(windows[i, -1, IDX_HCOS])
             hour = np.arctan2(hsin, hcos) / (2 * np.pi) * 24 % 24
-            if bedtime_only:
-                if not (20 <= hour < 24):   # evening 20:00–23:59 → predict full night
-                    continue
-            else:
-                if not (hour >= 22 or hour < 6):   # original nocturnal filter
-                    continue
-            future_mg  = windows[i + LOOKAHEAD, :ahead, IDX_CGM] * std + mean
-            hypo_steps = np.where(future_mg < HYPO_THRESHOLD)[0]
-            if hypo_steps.size > 0:
-                t_event = float(hypo_steps[0] + 1)   # 1-indexed steps
-                event   = 1.0
-            else:
-                t_event = float(ahead)                # censored at horizon end
-                event   = 0.0
-            yield windows[i], np.array([t_event, event], dtype=np.float32)
+            if not (21 <= hour < 24):
+                continue
+            future_mg = (windows[i + LOOKAHEAD, :HYPO_AHEAD_NOCTURNAL, IDX_CGM]
+                         * std + mean)
+            label = np.float32(1.0 if np.any(future_mg < HYPO_THRESHOLD) else 0.0)
+            yield windows[i], label
 
 
 def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
                        batch_size: int = 128,
-                       max_train_patients: Optional[int] = None,
-                       bedtime_only: bool = False):
+                       max_train_patients: Optional[int] = None):
     """
-    Returns train/val/test tf.data.Dataset objects for nocturnal hypo-risk (Weibull).
-    Label is [time_to_event, delta] — no pos_weight needed for Weibull NLL.
-    max_train_patients caps only the training split; val/test remain at full size.
+    Returns train/val/test tf.data.Dataset objects for bedtime binary hypo-risk.
+    Label is scalar float32 (0/1). max_train_patients caps only training split.
     """
     import tensorflow as tf
 
@@ -288,12 +271,12 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
 
     sig = (
         tf.TensorSpec((WINDOW_LEN, 10), tf.float32),
-        tf.TensorSpec((2,),             tf.float32),
+        tf.TensorSpec((),               tf.float32),
     )
 
     def make_ds(split_patients, shuffle, repeat=False):
         ds = tf.data.Dataset.from_generator(
-            lambda p=split_patients: _hypo_gen(p, bedtime_only=bedtime_only),
+            lambda p=split_patients: _hypo_gen(p),
             output_signature=sig
         )
         if shuffle:
@@ -304,18 +287,13 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
         return ds.prefetch(2)
 
     print('  Scanning labels (all splits)...', flush=True)
-    label_batches = []
-    for _, y in make_ds(train_p, shuffle=False):
-        label_batches.append(y.numpy())
-    steps_per_epoch = len(label_batches)
-    train_labels = np.concatenate(label_batches)
-
-    val_labels  = np.concatenate([y.numpy() for _, y in make_ds(val_p,  shuffle=False)])
-    test_labels = np.concatenate([y.numpy() for _, y in make_ds(test_p, shuffle=False)])
-    all_labels  = np.concatenate([train_labels, val_labels, test_labels])
+    train_labels = np.concatenate([y.numpy() for _, y in make_ds(train_p, shuffle=False)])
+    val_labels   = np.concatenate([y.numpy() for _, y in make_ds(val_p,   shuffle=False)])
+    test_labels  = np.concatenate([y.numpy() for _, y in make_ds(test_p,  shuffle=False)])
+    steps_per_epoch = int(np.ceil(len(train_labels) / batch_size))
 
     def _split_summary(labels, name):
-        n = len(labels); pos = int(labels[:, 1].sum())
+        n = len(labels); pos = int(labels.sum())
         print(f'    {name:<6} windows={n:>6}  hypos={pos:>4}  rate={pos/max(n,1):.3f}',
               flush=True)
         return n, pos
@@ -326,9 +304,9 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
     n_tot = n_tr + n_va + n_te; p_tot = p_tr + p_va + p_te
     print(f'    {"TOTAL":<6} windows={n_tot:>6}  hypos={p_tot:>4}  rate={p_tot/max(n_tot,1):.3f}',
           flush=True)
-
-    pos_rate = float(train_labels[:, 1].mean())   # delta column (train only, for loss)
     print(f'  steps_per_epoch: {steps_per_epoch}', flush=True)
+
+    pos_rate = float(train_labels.mean())
 
     return {
         'train':           make_ds(train_p, shuffle=True, repeat=True),
@@ -342,15 +320,15 @@ def make_hypo_dataset(patients, val_split: float = 0.1, test_split: float = 0.1,
     }
 
 
-def make_eval_hypo_dataset(patients, batch_size: int = 128, bedtime_only: bool = False):
+def make_eval_hypo_dataset(patients, batch_size: int = 128):
     """Fresh non-repeating hypo eval dataset — call per variant to avoid exhaustion."""
     import tensorflow as tf
     sig = (
         tf.TensorSpec((WINDOW_LEN, 10), tf.float32),
-        tf.TensorSpec((2,),             tf.float32),
+        tf.TensorSpec((),               tf.float32),
     )
     ds = tf.data.Dataset.from_generator(
-        lambda p=patients: _hypo_gen(p, bedtime_only=bedtime_only),
+        lambda p=patients: _hypo_gen(p),
         output_signature=sig
     )
     return ds.batch(batch_size).prefetch(2)

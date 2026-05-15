@@ -25,8 +25,6 @@ def parse_args():
     parser.add_argument('--batch_size',   type=int,   default=128)
     parser.add_argument('--eval_only',    action='store_true',
                         help='Skip training; load saved weights and run evaluation only')
-    parser.add_argument('--bedtime_only', action='store_true',
-                        help='Hypo risk: bedtime filter (20:00–23:59) + 8h horizon')
     return parser.parse_args()
 
 

@@ -30,10 +30,10 @@ from src.encoder import (
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR          = 'data/processed/adults'
-ENCODER_WEIGHTS   = 'results/mtsm/encoder_clean/encoder_weights.weights.h5'
-DECODER_WEIGHTS   = 'results/mtsm/decoder_clean/encoder_weights.weights.h5'
-OUT_DIR           = 'results/embedding_study'
+DATA_DIR          = 'data/processed/adults_global_norm'
+ENCODER_WEIGHTS   = 'results/mtsm/encoder_global_norm/encoder_weights.weights.h5'
+DECODER_WEIGHTS   = 'results/mtsm/decoder_global_norm/encoder_weights.weights.h5'
+OUT_DIR           = 'results/embedding_study_global_norm'
 PLOT_DIR          = os.path.join(OUT_DIR, 'plots')
 
 # ── Constants ──────────────────────────────────────────────────────────────────

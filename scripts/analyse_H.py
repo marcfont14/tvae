@@ -335,15 +335,6 @@ def plot_attention_case_studies(encoder, windows, results_dir, n_cases=3, encode
                                  interpolation='nearest', origin='upper')
                 plt.colorbar(im, ax=ax_a, fraction=0.046, pad=0.04)
 
-                for bt in np.where(win[:, BOLUS_IDX] > 0)[0]:
-                    bd = bt // step
-                    ax_a.axvline(bd, color=COLORS['bolus'], lw=0.9, alpha=0.8, ls='--')
-                    ax_a.axhline(bd, color=COLORS['bolus'], lw=0.9, alpha=0.8, ls='--')
-                for ct in np.where(win[:, CARBS_IDX] > 0)[0]:
-                    cd = ct // step
-                    ax_a.axvline(cd, color=COLORS['carbs'], lw=0.9, alpha=0.6, ls=':')
-                    ax_a.axhline(cd, color=COLORS['carbs'], lw=0.9, alpha=0.6, ls=':')
-
                 if encoder3:
                     _add_prefix_boundary(ax_a, step)
 

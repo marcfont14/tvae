@@ -282,12 +282,15 @@ def normalise_patient(
     df: pl.DataFrame,
     global_cgm_mean: float | None = None,
     global_cgm_std:  float | None = None,
+    global_pi_mean:  float | None = None,
+    global_pi_std:   float | None = None,
+    global_ra_mean:  float | None = None,
+    global_ra_std:   float | None = None,
 ) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
     """
     Z-score normalise CGM, PI, RA.
-    CGM: uses global_cgm_mean/std if provided (preserves between-patient differences);
-         falls back to per-patient z-score otherwise.
-    PI, RA: always per-patient z-scored.
+    If a global scaler is provided for a channel, it is used (preserving
+    between-patient differences); otherwise falls back to per-patient z-score.
     Returns normalised df and scaler parameters (mean, std) for [CGM, PI, RA].
     """
     cols = ['CGM', 'PI', 'RA']
@@ -298,6 +301,12 @@ def normalise_patient(
     if global_cgm_mean is not None and global_cgm_std is not None:
         means[0] = global_cgm_mean
         stds[0]  = global_cgm_std
+    if global_pi_mean is not None and global_pi_std is not None:
+        means[1] = global_pi_mean
+        stds[1]  = global_pi_std
+    if global_ra_mean is not None and global_ra_std is not None:
+        means[2] = global_ra_mean
+        stds[2]  = global_ra_std
 
     df = df.with_columns([
         ((pl.col(c) - float(means[i])) / float(stds[i])).alias(c)
@@ -382,10 +391,17 @@ def run_preprocessing(cfg: Settings | None = None,
     output_dir  = cfg.paths.data_processed
 
     global_cgm_mean, global_cgm_std = None, None
+    global_pi_mean,  global_pi_std  = None, None
+    global_ra_mean,  global_ra_std  = None, None
     if global_scaler_path:
         gs = np.load(global_scaler_path)
         global_cgm_mean, global_cgm_std = float(gs[0]), float(gs[1])
         print(f'Global CGM scaler: mean={global_cgm_mean:.2f}  std={global_cgm_std:.2f}')
+        if len(gs) >= 6:
+            global_pi_mean, global_pi_std = float(gs[2]), float(gs[3])
+            global_ra_mean, global_ra_std = float(gs[4]), float(gs[5])
+            print(f'Global PI  scaler: mean={global_pi_mean:.4f}  std={global_pi_std:.4f}')
+            print(f'Global RA  scaler: mean={global_ra_mean:.4f}  std={global_ra_std:.4f}')
 
     print(f"Input:  {input_path}")
     print(f"Output: {output_dir}")
@@ -426,7 +442,12 @@ def run_preprocessing(cfg: Settings | None = None,
         )
 
         # 7. Normalise
-        df_pd, means, stds = normalise_patient(df_pd, global_cgm_mean, global_cgm_std)
+        df_pd, means, stds = normalise_patient(
+            df_pd,
+            global_cgm_mean, global_cgm_std,
+            global_pi_mean,  global_pi_std,
+            global_ra_mean,  global_ra_std,
+        )
 
         # 8. Windows
         windows = extract_windows(df_pd, cfg)
@@ -486,7 +507,8 @@ if __name__ == '__main__':
     parser.add_argument('--min-age',        type=float, default=None)
     parser.add_argument('--max-age',        type=float, default=None)
     parser.add_argument('--global-scaler',  type=str,   default=None,
-                        help='Path to .npy file with [global_cgm_mean, global_cgm_std]')
+                        help='Path to .npy file with [cgm_mean, cgm_std] or '
+                             '[cgm_mean, cgm_std, pi_mean, pi_std, ra_mean, ra_std]')
     args = parser.parse_args()
 
     cfg = Settings()

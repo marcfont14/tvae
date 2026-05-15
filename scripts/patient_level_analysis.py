@@ -35,9 +35,9 @@ from sklearn.model_selection import KFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-EMB_DIR       = 'results/embedding_study'
-OUT_DIR       = 'results/patient_level'
-DATA_DIR      = 'data/processed/adults'
+EMB_DIR       = 'results/embedding_study_global_norm'
+OUT_DIR       = 'results/patient_level_global_norm'
+DATA_DIR      = 'data/processed/adults_global_norm'
 
 METABONET_TRAIN = 'data/raw/metabonet_train_filtered.parquet'
 METABONET_TEST  = 'data/raw/metabonet_test_filtered.parquet'
@@ -47,6 +47,8 @@ T1DEXI_LB       = 'data/raw/T1DEXI/LB.csv'
 GLOBAL_CGM_MEAN = 144.40
 GLOBAL_CGM_STD  = 57.11
 CGM_IDX = 0
+PI_IDX  = 1
+RA_IDX  = 2
 
 SEED = 42
 np.random.seed(SEED)
@@ -83,6 +85,38 @@ def compute_cgm_stats(pids):
             cv  = float(cgm_mg.std() / (cgm_mg.mean() + 1e-8))
             stats[pid] = np.array([cgm_mg.mean(), cgm_mg.std(), tir, tar, tbr, cv],
                                    dtype=np.float32)
+        except Exception:
+            pass
+    return stats
+
+
+def compute_cgm_pi_ra_stats(pids):
+    """
+    Return dict pid -> feature vector:
+      CGM stats (6) + mean PI curve (288,) + mean RA curve (288,)  =  582-d.
+    Mean curves are averaged across all windows, giving the patient's typical
+    24h PI/RA profile — same temporal information the transformer sees.
+    Ridge+PCA is applied downstream to handle the dimensionality.
+    """
+    stats = {}
+    for pid in pids:
+        fpath = os.path.join(DATA_DIR, f'{pid}.npz')
+        if not os.path.exists(fpath):
+            continue
+        try:
+            d = np.load(fpath)
+            windows = d['windows']                        # (N, 288, 11)
+            cgm_z  = windows[:, :, CGM_IDX].ravel()
+            cgm_mg = cgm_z * GLOBAL_CGM_STD + GLOBAL_CGM_MEAN
+            tir = float(((cgm_mg >= 70) & (cgm_mg <= 180)).mean())
+            tar = float((cgm_mg > 180).mean())
+            tbr = float((cgm_mg < 70).mean())
+            cv  = float(cgm_mg.std() / (cgm_mg.mean() + 1e-8))
+            cgm_feats = np.array([cgm_mg.mean(), cgm_mg.std(), tir, tar, tbr, cv],
+                                  dtype=np.float32)
+            mean_pi = windows[:, :, PI_IDX].mean(axis=0).astype(np.float32)  # (288,)
+            mean_ra = windows[:, :, RA_IDX].mean(axis=0).astype(np.float32)  # (288,)
+            stats[pid] = np.concatenate([cgm_feats, mean_pi, mean_ra])        # (582,)
         except Exception:
             pass
     return stats
@@ -221,41 +255,48 @@ def ridge_probe(X, y, n_splits=5, n_pca=None):
 
 # ── Run one target ─────────────────────────────────────────────────────────────
 
-def run_target(name, label_dict, enc_embs, dec_embs, cgm_stats, pids, axes):
+def run_target(name, label_dict, enc_embs, dec_embs, cgm_stats, full_stats, pids, axes):
     """
-    Align patients, run probes for encoder / decoder / cgm_stats,
-    print results, fill axes[0..2] with scatter plots.
+    Align patients, run probes for encoder / decoder / cgm_stats / full_stats,
+    print results, fill axes[0..3] with scatter plots.
     """
-    # align
+    # align — require both stat dicts to be present
     common = [p for p in pids
-              if p in label_dict and p in cgm_stats]
+              if p in label_dict and p in cgm_stats and p in full_stats]
     if len(common) < 20:
         print(f'  {name}: only {len(common)} patients — skipping.')
         return None
 
-    idx_map = {p: i for i, p in enumerate(pids)}
-    idx     = [idx_map[p] for p in common]
-    y       = np.array([label_dict[p] for p in common])
-    X_enc   = enc_embs[idx]
-    X_dec   = dec_embs[idx]
-    X_cgm   = np.stack([cgm_stats[p] for p in common])
+    idx_map  = {p: i for i, p in enumerate(pids)}
+    idx      = [idx_map[p] for p in common]
+    y        = np.array([label_dict[p] for p in common])
+    X_enc    = enc_embs[idx]
+    X_dec    = dec_embs[idx]
+    X_cgm    = np.stack([cgm_stats[p] for p in common])
+    X_full   = np.stack([full_stats[p] for p in common])
 
     results = {}
-    for feat_name, X, n_pca in [('Encoder h_cls',    X_enc, None),
-                                  ('Encoder+PCA-10',   X_enc,   10),
-                                  ('Decoder H',        X_dec, None),
-                                  ('Decoder+PCA-10',   X_dec,   10),
-                                  ('CGM stats',        X_cgm, None)]:
+    for feat_name, X, n_pca in [('Encoder h_cls',      X_enc,  None),
+                                  ('Encoder+PCA-10',     X_enc,    10),
+                                  ('Decoder H',          X_dec,  None),
+                                  ('Decoder+PCA-10',     X_dec,    10),
+                                  ('CGM stats',          X_cgm,  None),
+                                  ('CGM+PI+RA curves',   X_full,   32)]:
         r2, std = ridge_probe(X, y, n_pca=n_pca)
         results[feat_name] = (r2, std)
-        print(f'    {feat_name:20s}  R²={r2:.3f} ± {std:.3f}')
+        print(f'    {feat_name:22s}  R²={r2:.3f} ± {std:.3f}')
 
-    # scatter: encoder predictions vs actual (full fit for visual)
-    for ax, (feat_name, X) in zip(axes, [('Encoder h_cls', X_enc),
-                                           ('Decoder H', X_dec),
-                                           ('CGM stats', X_cgm)]):
-        pipe = make_pipeline(StandardScaler(),
-                             RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0], cv=5))
+    # scatter: full fit for visual (4 panels: encoder, decoder, CGM, CGM+PI+RA)
+    for ax, (feat_name, X, n_pca) in zip(axes, [('Encoder h_cls',     X_enc,  None),
+                                                  ('Decoder H',         X_dec,  None),
+                                                  ('CGM stats',         X_cgm,  None),
+                                                  ('CGM+PI+RA curves',  X_full,   32)]):
+        steps = [StandardScaler()]
+        if n_pca is not None:
+            steps.append(PCA(n_components=min(n_pca, X.shape[0]-1, X.shape[1]),
+                             random_state=SEED))
+        steps.append(RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0], cv=5))
+        pipe = make_pipeline(*steps)
         pipe.fit(X, y)
         y_pred = pipe.predict(X)
         r2 = results[feat_name][0]
@@ -272,8 +313,8 @@ def run_target(name, label_dict, enc_embs, dec_embs, cgm_stats, pids, axes):
 
 def plot_summary(all_results, out_path):
     targets   = list(all_results.keys())
-    feat_names = ['Encoder h_cls', 'Decoder H', 'CGM stats']
-    colors     = ['#2196F3', '#FF9800', '#4CAF50']
+    feat_names = ['Encoder h_cls', 'Decoder H', 'CGM stats', 'CGM+PI+RA curves']
+    colors     = ['#2196F3', '#FF9800', '#4CAF50', '#9C27B0']
 
     n = len(targets)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), sharey=False)
@@ -313,9 +354,10 @@ def main():
     enc_embs, dec_embs, pids, _ = load_cached()
     print(f'  Encoder: {enc_embs.shape}, Decoder: {dec_embs.shape}, Patients: {len(pids)}')
 
-    print('\nComputing CGM stats from .npz...')
-    cgm_stats = compute_cgm_stats(pids)
-    print(f'  CGM stats computed for {len(cgm_stats)} patients')
+    print('\nComputing stats from .npz...')
+    cgm_stats  = compute_cgm_stats(pids)
+    full_stats = compute_cgm_pi_ra_stats(pids)
+    print(f'  CGM stats: {len(cgm_stats)} patients, CGM+PI+RA curves: {len(full_stats)} patients')
 
     print('\nDeriving labels...')
     hba1c_dict = load_hba1c()
@@ -335,15 +377,15 @@ def main():
 
     all_results = {}
     fig_scatter, ax_scatter = plt.subplots(
-        len(targets), 3,
-        figsize=(15, 5 * len(targets))
+        len(targets), 4,
+        figsize=(20, 5 * len(targets))
     )
 
     for row_i, (tgt_name, label_dict) in enumerate(targets.items()):
         print(f'\n── {tgt_name} ──')
         axes_row = ax_scatter[row_i] if len(targets) > 1 else ax_scatter
         res = run_target(tgt_name, label_dict, enc_embs, dec_embs,
-                         cgm_stats, pids, axes_row)
+                         cgm_stats, full_stats, pids, axes_row)
         if res is not None:
             all_results[tgt_name] = res
 
@@ -359,13 +401,14 @@ def main():
 
     # Print summary table
     print('\n── Summary ──')
-    print(f'{"Target":<20} {"Encoder R²":>12} {"Decoder R²":>12} {"CGM stats R²":>14}')
-    print('-' * 62)
+    print(f'{"Target":<20} {"Encoder R²":>12} {"Decoder R²":>12} {"CGM stats R²":>14} {"CGM+PI+RA R²":>14}')
+    print('-' * 76)
     for tgt, res in all_results.items():
-        enc_r2 = f"{res.get('Encoder h_cls', (float('nan'),))[0]:.3f}"
-        dec_r2 = f"{res.get('Decoder H', (float('nan'),))[0]:.3f}"
-        cgm_r2 = f"{res.get('CGM stats', (float('nan'),))[0]:.3f}"
-        print(f'{tgt:<20} {enc_r2:>12} {dec_r2:>12} {cgm_r2:>14}')
+        enc_r2  = f"{res.get('Encoder h_cls',    (float('nan'),))[0]:.3f}"
+        dec_r2  = f"{res.get('Decoder H',        (float('nan'),))[0]:.3f}"
+        cgm_r2  = f"{res.get('CGM stats',        (float('nan'),))[0]:.3f}"
+        full_r2 = f"{res.get('CGM+PI+RA curves',  (float('nan'),))[0]:.3f}"
+        print(f'{tgt:<20} {enc_r2:>12} {dec_r2:>12} {cgm_r2:>14} {full_r2:>14}')
 
     print('\nDone.')
 

@@ -78,11 +78,11 @@ GluFormer+Diet feeds dietary tokens + recent CGM history as context into the cau
 |Attention direction|Unidirectional (past → future only)|Bidirectional (full context)|
 |Input modalities|CGM only|CGM + PI + RA + bolus + carbs + modality|
 |Population|Non-diabetic adults (HPP cohort)|T1D patients (METABONET + T1DEXI)|
-|Transfer capability|Single-task forecasting only|Multi-task: forecasting + hypo risk + imputation + ISF/CR|
+|Transfer capability|Single task (long-term outcome stratification)|Multi-task: forecasting + hypo risk + imputation + ISF/CR|
 |Physiological grounding|None|PI and RA (Hovorka model) as explicit input drivers|
-|Clinical target|Risk stratification, long-term outcomes (non-T1D)|Multi-task therapy support (T1D)|
+|Clinical target|Long-term outcomes (diabetes onset risk, CVD mortality) on non-T1D population|Short-term clinical decisions for T1D management|
 
-**Key argument for thesis:** GluFormer is the dominant CGM foundation model but it is a single-task forecasting model — causal attention means it cannot use future context to fill a gap, it has no multi-task transfer capability, and it has no principled way to simulate counterfactual insulin scenarios. Our model addresses this: the bidirectional encoder learns a rich representation H grounded in physiological drivers (PI, RA), and a single frozen encoder supports multiple downstream tasks simultaneously — forecasting, hypo risk prediction, imputation, ISF/CR profiling. This is architecturally impossible in GluFormer's single-task autoregressive design.
+**Key argument for thesis:** GluFormer showed that pre-training on large CGM corpora produces generalisable representations, but it targets long-term outcome stratification (12-year follow-up) on a non-diabetic cohort, not the short-term clinical decisions that define T1D management. Its causal attention also means it cannot use future context for gap imputation. Our model is designed from the ground up for T1D: pre-trained exclusively on T1D patients, with ODE-derived physiological drivers, and evaluated on clinically relevant short-term tasks.
 
 - **Cite:** When introducing related work on CGM foundation models. Cite extensively when positioning our contribution in the Discussion. Also cite in the Introduction to motivate the need for T1D-specific, driver-aware, counterfactual models.
 
@@ -308,7 +308,7 @@ _(Ready-to-use table for thesis Related Work section)_
 |Input|CGM only|CGM only|CGM + PI + RA + bolus + carbs + modality ✅|
 |Physiological grounding|None|None|Hovorka-derived PI and RA ✅|
 |Population|Non-diabetic adults|T2D / prediabetes (Chinese)|**T1D** (METABONET + T1DEXI) ✅|
-|Dataset size|10,812 subjects, >10M measurements|964 subjects (pre-train); 58,847 (extended)|988 adults, 951K windows|
+|Dataset size|10,812 subjects, >10M measurements|964 subjects (pre-train); 58,847 (extended)|1,037 adults, ~1M windows (934 pretrain)|
 |Transfer capability|Single task|Single task per paper|**Multi-task: one encoder → 4+ applications** ✅|
 |Patient representation|Deterministic (max pool)|Deterministic (mean-pool)|Full H (288, 128) — temporal resolution preserved ✅|
 |Downstream tasks|Risk stratification (single)|Classification, imputation (single)|Forecasting + hypo risk + imputation + ISF/CR ✅|

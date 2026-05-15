@@ -11,10 +11,10 @@ N_LAYERS   = 5
 D_FF       = 256
 DROPOUT    = 0.2
 
-WEIGHTS_PATH        = 'results/mtsm/encoder_clean/encoder_weights.weights.h5'
+WEIGHTS_PATH        = 'results/mtsm/encoder_global_norm/encoder_weights.weights.h5'
 WEIGHTS_PATH_E3     = 'results/mtsm/encoder3/encoder_weights.weights.h5'
-WEIGHTS_PATH_DECODER  = 'results/mtsm/decoder_clean/encoder_weights.weights.h5'
-NTP_MODEL_WEIGHTS     = 'results/mtsm/decoder/model_weights.weights.h5'
+WEIGHTS_PATH_DECODER  = 'results/mtsm/decoder_global_norm/encoder_weights.weights.h5'
+NTP_MODEL_WEIGHTS     = 'results/mtsm/decoder_global_norm/model_weights.weights.h5'
 WEIGHTS_PATH_DECODER2 = 'results/mtsm/decoder2/encoder_weights.weights.h5'
 NTP_HEAD2_WEIGHTS     = 'results/mtsm/decoder2/ntp_head_weights.weights.h5'
 PREFIX_LEN           = 144   # steps 0-143 bidirectional, 144-287 causal+full-prefix
@@ -168,31 +168,45 @@ def load_decoder(weights_path: str = WEIGHTS_PATH_DECODER, trainable: bool = Fal
     return decoder
 
 
+_NTP_K_BINS    = 200
+_NTP_BIN_Z_MIN = (40.0  - 144.40) / 57.11
+_NTP_BIN_Z_MAX = (400.0 - 144.40) / 57.11
+_NTP_BIN_CTRS  = tf.constant(
+    [_NTP_BIN_Z_MIN + (_NTP_BIN_Z_MAX - _NTP_BIN_Z_MIN) * (k + 0.5) / _NTP_K_BINS
+     for k in range(_NTP_K_BINS)],
+    dtype=tf.float32,
+)   # (K,)
+
+
 def load_ntp_head(model_weights_path: str = NTP_MODEL_WEIGHTS) -> keras.Model:
     """
-    Load NTP Dense head from a saved full NTP model for AR rollout inference.
+    Load NTP Dense head from decoder_global_norm for AR rollout inference.
     Returns a head model: (B, 1, D_MODEL) → (B,) predicting next CGM z-score.
 
-    The full NTP model structure: decoder → H[:,:-1,:] → Dense(64,relu,'ntp_hidden')
-    → Dense(1,'ntp_head') → Reshape(287,). We rebuild it, load weights, then
-    wrap the two Dense layers in a small head model for per-step AR inference.
+    decoder_global_norm uses K=200 bin CE head (build_ntp_model_clean):
+    H[:,:-1,:] → Dense(64,relu,'ntp_hidden') → Dense(200,'ntp_output').
+    Soft-argmax decodes logits → continuous z-score.
     """
     dec   = build_decoder()
     inp_f = keras.Input(shape=(WINDOW_LEN, N_FEATURES), name='input')
     H_f, _ = dec(inp_f)
     H_p   = layers.Lambda(lambda z: z[:, :-1, :], name='H_pred')(H_f)
-    h_out = layers.Dense(64, activation='relu', name='ntp_hidden')(H_p)
-    h_out = layers.Dense(1,  name='ntp_head')(h_out)
-    h_out = layers.Reshape((WINDOW_LEN - 1,), name='ntp_output')(h_out)
+    h_out = layers.Dense(64,          activation='relu', name='ntp_hidden')(H_p)
+    h_out = layers.Dense(_NTP_K_BINS,                   name='ntp_output')(h_out)
     full  = keras.Model(inp_f, h_out, name='NTP_Decoder')
     full(tf.zeros((1, WINDOW_LEN, N_FEATURES)))
     full.load_weights(model_weights_path)
 
-    # Build small head reusing the Dense layers (shared weights)
-    h_inp  = keras.Input(shape=(1, D_MODEL), name='h_input')
-    x      = full.get_layer('ntp_hidden')(h_inp)   # (B, 1, 64)
-    x      = full.get_layer('ntp_head')(x)          # (B, 1, 1)
-    out    = layers.Lambda(lambda z: z[:, 0, 0], name='pred_z')(x)  # (B,)
+    # Small head: (B, 1, D_MODEL) → (B,) via soft-argmax
+    h_inp = keras.Input(shape=(1, D_MODEL), name='h_input')
+    x     = full.get_layer('ntp_hidden')(h_inp)    # (B, 1, 64)
+    x     = full.get_layer('ntp_output')(x)         # (B, 1, K)
+    out   = layers.Lambda(
+        lambda logits: tf.reduce_sum(
+            tf.nn.softmax(logits[:, 0, :], axis=-1) * _NTP_BIN_CTRS, axis=-1
+        ),
+        name='pred_z',
+    )(x)   # (B,)
     return keras.Model(h_inp, out, name='NTPHead')
 
 
