@@ -554,6 +554,244 @@ def fig_consistency(enc_coords, gri, tir, therapy, spread):
     print(f'  Pearson r (spread vs GRI): {r:.3f}  {pstr}')
 
 
+# ── Figure 8: Subspace geometry — PCA scatter + confidence ellipses ───────────
+
+def fig_subspace_geometry(enc_embs, dec_embs, gri, therapy):
+    """
+    2×2 figure: rows = encoder / decoder, cols = GRI quartile / therapy.
+    Each panel: PCA top-2 projection, scatter coloured by group,
+    2σ confidence ellipses (within-group covariance), centroid stars.
+    Directly visualises MCR² geometry: incoherent subspaces → ellipses pointing
+    in different directions; compact clusters → tight ellipses.
+    """
+    from matplotlib.patches import Ellipse
+
+    gri_q = gri_quartile(gri)
+
+    def draw_ellipse(ax, x, y, color, n_std=2.0):
+        if len(x) < 5:
+            return
+        cov = np.cov(x, y)
+        vals, vecs = np.linalg.eigh(cov)
+        order  = vals.argsort()[::-1]
+        vals   = vals[order]
+        vecs   = vecs[:, order]
+        angle  = np.degrees(np.arctan2(*vecs[:, 0][::-1]))
+        width  = 2 * n_std * np.sqrt(max(vals[0], 0))
+        height = 2 * n_std * np.sqrt(max(vals[1], 0))
+        ell = Ellipse(xy=(x.mean(), y.mean()), width=width, height=height,
+                      angle=angle, facecolor=color, alpha=0.13,
+                      edgecolor=color, linewidth=1.8, linestyle='--', zorder=2)
+        ax.add_patch(ell)
+        ax.scatter(x.mean(), y.mean(), color=color, s=80, zorder=5,
+                   marker='*', linewidths=0)
+
+    def pca2d(emb):
+        z   = StandardScaler().fit_transform(emb)
+        pca = PCA(n_components=2).fit(z)
+        return pca.transform(z), pca.explained_variance_ratio_
+
+    enc_2d, enc_var = pca2d(enc_embs)
+    dec_2d, dec_var = pca2d(dec_embs)
+
+    row_data = [
+        (enc_2d, enc_var, 'Encoder  ($h_{cls}$,  BERT-style)',  C_ENC),
+        (dec_2d, dec_var, 'Decoder  (mean-pool $H$,  GPT-style)', C_DEC),
+    ]
+    col_data = [
+        (gri_q,   GRI_COLORS,     GRI_LABELS,     'GRI Quartile'),
+        (therapy, THERAPY_COLORS, THERAPY_LABELS, 'Therapy Modality'),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Embedding subspace geometry — PCA projection with 2$\\sigma$ confidence ellipses',
+                 fontsize=12, y=1.01)
+
+    for row, (coords, var, row_title, row_color) in enumerate(row_data):
+        for col, (labels, colors, leg_labels, col_title) in enumerate(col_data):
+            ax = axes[row, col]
+
+            for i, (color, lbl) in enumerate(zip(colors, leg_labels)):
+                mask = labels == i
+                if mask.sum() == 0:
+                    continue
+                x, y = coords[mask, 0], coords[mask, 1]
+                ax.scatter(x, y, c=color, s=7, alpha=0.55,
+                           linewidths=0, label=lbl, zorder=3)
+                draw_ellipse(ax, x, y, color)
+
+            if row == 0:
+                ax.set_title(col_title, fontsize=11, pad=6)
+
+            ax.set_xlabel(f'PC1  ({var[0]*100:.1f}% var)', fontsize=9)
+            ax.set_ylabel(f'PC2  ({var[1]*100:.1f}% var)', fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.legend(loc='upper right', markerscale=2.0, fontsize=8,
+                      handletextpad=0.3, borderpad=0.5, labelspacing=0.3,
+                      framealpha=0.85, edgecolor='#cccccc')
+
+            if col == 0:
+                ax.text(-0.22, 0.5, row_title,
+                        transform=ax.transAxes, fontsize=10,
+                        fontweight='bold', va='center', rotation=90,
+                        ha='center', color=row_color)
+
+    plt.tight_layout()
+    plt.subplots_adjust(left=0.13, wspace=0.25, hspace=0.28)
+    path = os.path.join(OUT_DIR, 'subspace_geometry.png')
+    fig.savefig(path)
+    plt.close()
+    print(f'  Saved: {path}')
+
+
+# ── Figure 8: MCR² representation geometry ────────────────────────────────────
+
+def _standardise(emb):
+    from sklearn.preprocessing import StandardScaler
+    return StandardScaler().fit_transform(emb)
+
+
+def _coding_rate(emb, eps=0.5):
+    N, D = emb.shape
+    M = np.eye(D) + (D / (N * eps ** 2)) * (emb.T @ emb)
+    sign, logdet = np.linalg.slogdet(M)
+    return float(0.5 * logdet) if sign > 0 else 0.0
+
+
+def _mcr2_delta(emb, labels, eps=0.5):
+    z = _standardise(emb)
+    n = len(z)
+    r_total = _coding_rate(z, eps)
+    r_class = sum(
+        (labels == l).sum() / n * _coding_rate(z[labels == l], eps)
+        for l in np.unique(labels)
+    )
+    return float(r_total - r_class)
+
+
+def _between_within_ratio(emb, labels):
+    z = _standardise(emb)
+    unique = np.unique(labels)
+    overall_mean = z.mean(axis=0)
+    n, D = z.shape
+    between, within = 0.0, 0.0
+    for l in unique:
+        grp  = z[labels == l]
+        mu_k = grp.mean(axis=0)
+        between += len(grp) * float(np.sum((mu_k - overall_mean) ** 2))
+        within  += float(np.sum((grp - mu_k) ** 2))
+    b = between / (n * D)
+    w = within  / (n * D)
+    return float(b / (w + 1e-8))
+
+
+def _subspace_incoherence(emb, labels, k=10):
+    z = _standardise(emb)
+    unique = np.unique(labels)
+    subspaces = {}
+    for l in unique:
+        grp    = z[labels == l]
+        n_comp = min(k, len(grp) - 1, z.shape[1])
+        if n_comp >= 1:
+            pca = PCA(n_components=n_comp).fit(grp)
+            subspaces[l] = pca.components_
+    pairs = [(l1, l2) for i, l1 in enumerate(unique)
+             for l2 in list(unique)[i + 1:]
+             if l1 in subspaces and l2 in subspaces]
+    if not pairs:
+        return 0.0
+    scores = []
+    for l1, l2 in pairs:
+        V1, V2 = subspaces[l1], subspaces[l2]
+        k_min = min(len(V1), len(V2))
+        inner = np.abs(V1[:k_min] @ V2[:k_min].T)
+        scores.append(1.0 - min(float(np.linalg.norm(inner, 'fro')) / k_min, 1.0))
+    return float(np.mean(scores))
+
+
+def fig_repr_geometry(enc_embs, dec_embs, gri, therapy):
+    """
+    Three-panel figure comparing encoder vs decoder on MCR²-motivated metrics:
+      Panel 1 — MCR² ΔR        (GRI quartile / therapy grouping)
+      Panel 2 — B/W ratio      (GRI quartile / therapy grouping)
+      Panel 3 — Subspace incoherence (GRI quartile / therapy grouping)
+    Each panel shows two bars per model (GRI quartile in solid, therapy in hatched).
+    """
+    gri_q = np.digitize(gri, np.percentile(gri, [25, 50, 75]))
+
+    metrics = {
+        'MCR² $\\Delta R$\n(higher = better)': (
+            _mcr2_delta(enc_embs, gri_q),
+            _mcr2_delta(dec_embs, gri_q),
+            _mcr2_delta(enc_embs, therapy),
+            _mcr2_delta(dec_embs, therapy),
+        ),
+        'Between / Within\nvariance ratio': (
+            _between_within_ratio(enc_embs, gri_q),
+            _between_within_ratio(dec_embs, gri_q),
+            _between_within_ratio(enc_embs, therapy),
+            _between_within_ratio(dec_embs, therapy),
+        ),
+        'Subspace\nincoherence': (
+            _subspace_incoherence(enc_embs, gri_q),
+            _subspace_incoherence(dec_embs, gri_q),
+            _subspace_incoherence(enc_embs, therapy),
+            _subspace_incoherence(dec_embs, therapy),
+        ),
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig.suptitle('Representation geometry (MCR² framework)', fontsize=12, y=1.02)
+
+    x      = np.array([0.0, 1.0])
+    width  = 0.32
+    labels = ['Encoder\n($h_{cls}$)', 'Decoder\n(mean-pool $H$)']
+
+    for ax, (title, (enc_gri, dec_gri, enc_th, dec_th)) in zip(axes, metrics.items()):
+        gri_vals = [enc_gri, dec_gri]
+        th_vals  = [enc_th,  dec_th]
+
+        bars_gri = ax.bar(x - width / 2, gri_vals, width,
+                          color=[C_ENC, C_DEC], alpha=0.90, zorder=3,
+                          label='GRI quartile grouping')
+        bars_th  = ax.bar(x + width / 2, th_vals,  width,
+                          color=[C_ENC, C_DEC], alpha=0.45, hatch='//',
+                          edgecolor='white', zorder=3,
+                          label='Therapy grouping')
+
+        # Value labels
+        for bar, val in zip(list(bars_gri) + list(bars_th),
+                            gri_vals + th_vals):
+            yoff = max(abs(val) * 0.03, 0.002)
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    val + yoff if val >= 0 else val - yoff,
+                    f'{val:.3f}', ha='center',
+                    va='bottom' if val >= 0 else 'top',
+                    fontsize=8, fontweight='bold')
+
+        ax.set_title(title, fontsize=10)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.axhline(0, color='#999999', lw=0.8)
+        ax.grid(axis='y', alpha=0.25, zorder=0)
+
+    # Shared legend on last axis
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#555555', alpha=0.9,  label='GRI quartile grouping'),
+        Patch(facecolor='#555555', alpha=0.45, hatch='//', label='Therapy grouping'),
+    ]
+    axes[-1].legend(handles=legend_elements, fontsize=9,
+                    loc='lower right', frameon=True)
+
+    plt.tight_layout()
+    path = os.path.join(OUT_DIR, 'repr_geometry.png')
+    fig.savefig(path)
+    plt.close()
+    print(f'  Saved: {path}')
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -585,6 +823,12 @@ def main():
         fig_consistency(enc_2d, gri, tir, therapy, spread)
     else:
         print('  [SKIP] consistency_scores.npy not found — run embedding_study.py first')
+
+    print('\n  Computing subspace geometry (PCA + ellipses)...')
+    fig_subspace_geometry(enc_embs, dec_embs, gri, therapy)
+
+    print('\n  Computing MCR² representation geometry...')
+    fig_repr_geometry(enc_embs, dec_embs, gri, therapy)
 
     print(f'\n  All plots saved to {OUT_DIR}/')
 

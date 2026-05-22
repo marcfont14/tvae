@@ -3,14 +3,12 @@ import os
 import time
 import numpy as np
 
-from src.encoder import (load_encoder, load_encoder3, load_decoder, load_ntp_head,
-                          load_decoder2, load_ntp_head2)
+from src.encoder import load_encoder, load_decoder, load_ntp_head
 from src.stage2.data import (load_all_patients, make_forecasting_dataset,
                               make_eval_dataset, make_ar_eval_data, naive_forecast,
                               HORIZON_LABELS, load_patient, LOOKAHEAD, N_HORIZONS,
                               IDX_CGM, CONTIGUITY_THRESHOLD)
-from src.stage2.models import (build_forecasting_lstm, build_forecasting_lstm_query,
-                               build_forecasting_lstm_hcls, build_forecasting_lstm_decoder,
+from src.stage2.models import (build_forecasting_lstm, build_forecasting_lstm_decoder,
                                build_raw_forecasting_lstm, predict_ar_decoder)
 from src.stage2.train import train
 from src.stage2.evaluate import (regression_metrics, clarke_zones, save_metrics,
@@ -19,40 +17,21 @@ from src.stage2.evaluate import (regression_metrics, clarke_zones, save_metrics,
                                   plot_horizon_comparison, plot_forecast_traces,
                                   save_comparison_table)
 
-# Variants: Raw / FM frozen / FM fine-tuned / decoder frozen (AR) / decoder fine-tuned / legacy
 VARIANTS = [
     ('raw',          'lstm'),
     ('fm',           'lstm'),
-    ('fm_ft',        'lstm'),   # encoder2 fine-tuned + AttentionPool
-    ('fm_query',     'lstm'),
-    ('fm_hcls',      'lstm'),
-    ('fm_e3',        'lstm'),   # encoder3 + AttentionPool
-    ('fm_query_e3',  'lstm'),   # encoder3 + QueryCrossAttention
-    ('fm_decoder',    'lstm'),   # decoder frozen — AR rollout, no LSTM head
-    ('fm_decoder_ft', 'lstm'),   # decoder fine-tuned — h_last + LSTM head
-    ('fm_decoder2',   'lstm'),   # decoder2 frozen — delta AR rollout
-    ('fm_decoder2_ft','lstm'),   # decoder2 fine-tuned — h_last + LSTM head
+    ('fm_ft',        'lstm'),
+    ('fm_decoder',   'lstm'),   # decoder frozen — AR rollout, no LSTM head
+    ('fm_decoder_ft','lstm'),   # decoder fine-tuned — h_last + LSTM head
 ]
 
 _MODE_SETS = {
-    'raw':            {'raw'},
-    'fm':             {'fm'},
-    'fm_ft':          {'fm_ft'},
-    'fm_query':       {'fm_query'},
-    'fm_hcls':        {'fm_hcls'},
-    'fm_e3':          {'fm_e3'},
-    'fm_query_e3':    {'fm_query_e3'},
-    'fm_decoder':     {'fm_decoder'},
-    'fm_decoder_ft':  {'fm_decoder_ft'},
-    'fm_decoder2':    {'fm_decoder2'},
-    'fm_decoder2_ft': {'fm_decoder2_ft'},
-    'all':            {'raw', 'fm', 'fm_query', 'fm_hcls'},
-    'all_e3':         {'fm_e3', 'fm_query_e3'},
-    'all_decoder':    {'raw', 'fm_hcls', 'fm_decoder', 'fm_decoder_ft'},
-    'decoder2':       {'fm_decoder2', 'fm_decoder2_ft'},
-    'thesis':         {'raw', 'fm', 'fm_ft', 'fm_decoder', 'fm_decoder_ft'},
-    'thesis2':        {'raw', 'fm', 'fm_ft', 'fm_decoder2', 'fm_decoder2_ft'},
-    'de':             {'raw', 'fm', 'fm_ft', 'fm_decoder_ft'},
+    'raw':           {'raw'},
+    'fm':            {'fm'},
+    'fm_ft':         {'fm_ft'},
+    'fm_decoder':    {'fm_decoder'},
+    'fm_decoder_ft': {'fm_decoder_ft'},
+    'thesis':        {'raw', 'fm', 'fm_ft', 'fm_decoder', 'fm_decoder_ft'},
 }
 
 
@@ -61,18 +40,8 @@ def _build_model(mode: str, arch: str) -> object:
         return build_forecasting_lstm(load_encoder(trainable=False))
     elif mode == 'fm_ft':
         return build_forecasting_lstm(load_encoder(trainable=True))
-    elif mode == 'fm_query':
-        return build_forecasting_lstm_query(load_encoder(trainable=False))
-    elif mode == 'fm_hcls':
-        return build_forecasting_lstm_hcls(load_encoder(trainable=False))
-    elif mode == 'fm_e3':
-        return build_forecasting_lstm(load_encoder3(trainable=False))
-    elif mode == 'fm_query_e3':
-        return build_forecasting_lstm_query(load_encoder3(trainable=False))
     elif mode == 'fm_decoder_ft':
         return build_forecasting_lstm_decoder(load_decoder(trainable=True))
-    elif mode == 'fm_decoder2_ft':
-        return build_forecasting_lstm_decoder(load_decoder2(trainable=True))
     else:  # raw — pure LSTM, no encoder
         return build_raw_forecasting_lstm()
 
@@ -129,10 +98,9 @@ def run(args):
         print(f'\n--- {tag.upper()} ---')
 
         # ── Autoregressive decoder — no training, no LSTM head ───────────────
-        if mode in ('fm_decoder', 'fm_decoder2'):
-            use_delta = (mode == 'fm_decoder2')
-            decoder  = load_decoder2(trainable=False) if use_delta else load_decoder(trainable=False)
-            ntp_head = load_ntp_head2()               if use_delta else load_ntp_head()
+        if mode == 'fm_decoder':
+            decoder  = load_decoder(trainable=False)
+            ntp_head = load_ntp_head()
             ar_data  = make_ar_eval_data(splits['test_patients'])
             MAX_AR = 10_000
             if len(ar_data['windows']) > MAX_AR:
@@ -145,7 +113,6 @@ def run(args):
                 decoder, ntp_head,
                 ar_data['windows'], ar_data['scaler_std'],
                 N_HORIZONS, ar_data['last_cgm_mg'],
-                delta_mode=use_delta
             )
             y_test = ar_data['y_mg']
             ar_sec = time.time() - t0
@@ -174,9 +141,9 @@ def run(args):
             gc.collect()
             continue  # skip LSTM train/eval below
 
-        if mode in ('fm', 'fm_query', 'fm_hcls', 'fm_e3', 'fm_query_e3'):
+        if mode == 'fm':
             lr, patience = getattr(args, 'lr',     1e-3), 10
-        elif mode in ('fm_ft', 'fm_decoder_ft', 'fm_decoder2_ft'):
+        elif mode in ('fm_ft', 'fm_decoder_ft'):
             lr, patience = getattr(args, 'lr_ft',  1e-4), 15
         else:  # raw
             lr, patience = getattr(args, 'lr_raw', 1e-4), 15

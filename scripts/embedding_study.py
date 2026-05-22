@@ -242,6 +242,101 @@ def knn_consistency(emb: np.ndarray, gri: np.ndarray, k: int = 10) -> float:
     return float(np.mean(consistency))
 
 
+# ── MCR² representation geometry ──────────────────────────────────────────────
+
+def _standardise(emb: np.ndarray) -> np.ndarray:
+    """Zero-mean unit-variance per dimension (makes coding rates comparable)."""
+    from sklearn.preprocessing import StandardScaler
+    return StandardScaler().fit_transform(emb)
+
+
+def coding_rate(emb: np.ndarray, eps: float = 0.5) -> float:
+    """
+    Gaussian coding rate: R_eps(Z) = 0.5 * log det(I_D + D/(N*eps^2) * Z^T Z).
+    Measures total spread of the embedding distribution.
+    emb should be standardised before calling.
+    """
+    N, D = emb.shape
+    M = np.eye(D) + (D / (N * eps ** 2)) * (emb.T @ emb)
+    sign, logdet = np.linalg.slogdet(M)
+    return float(0.5 * logdet) if sign > 0 else 0.0
+
+
+def mcr2_delta(emb: np.ndarray, labels: np.ndarray, eps: float = 0.5) -> dict:
+    """
+    Maximal Coding Rate Reduction (MCR²):
+      ΔR = R_eps(Z) - sum_k (n_k/n) * R_eps(Z_k)
+    High ΔR = between-group diversity exceeds within-group spread = good representation.
+    Reference: Buchanan et al. (2025), Chapter 4.
+    """
+    z = _standardise(emb)
+    r_total = coding_rate(z, eps)
+    n = len(z)
+    r_class = sum(
+        (labels == l).sum() / n * coding_rate(z[labels == l], eps)
+        for l in np.unique(labels)
+    )
+    return {'R_total': float(r_total), 'R_class': float(r_class),
+            'delta_R': float(r_total - r_class)}
+
+
+def between_within_ratio(emb: np.ndarray, labels: np.ndarray) -> dict:
+    """
+    Fisher-criterion between-group / within-group variance ratio.
+    High ratio = groups are compact and well separated.
+    """
+    z = _standardise(emb)
+    unique = np.unique(labels)
+    overall_mean = z.mean(axis=0)
+    n, D = z.shape
+
+    between, within = 0.0, 0.0
+    for l in unique:
+        grp  = z[labels == l]
+        mu_k = grp.mean(axis=0)
+        between += len(grp) * float(np.sum((mu_k - overall_mean) ** 2))
+        within  += float(np.sum((grp - mu_k) ** 2))
+
+    between_norm = between / (n * D)
+    within_norm  = within  / (n * D)
+    return {'between': between_norm, 'within': within_norm,
+            'ratio': float(between_norm / (within_norm + 1e-8))}
+
+
+def subspace_incoherence(emb: np.ndarray, labels: np.ndarray, k: int = 10) -> float:
+    """
+    Mean pairwise incoherence between top-k PCA subspaces of each group.
+    1 = fully incoherent (orthogonal subspaces, MCR² ideal).
+    0 = fully coherent (groups share the same directions).
+    Reference: Buchanan et al. (2025), Chapter 4-5.
+    """
+    from sklearn.decomposition import PCA
+    z = _standardise(emb)
+    unique = np.unique(labels)
+    subspaces = {}
+    for l in unique:
+        grp = z[labels == l]
+        n_comp = min(k, len(grp) - 1, z.shape[1])
+        if n_comp >= 1:
+            pca = PCA(n_components=n_comp).fit(grp)
+            subspaces[l] = pca.components_   # (n_comp, D)
+
+    pairs = [(l1, l2) for i, l1 in enumerate(unique)
+             for l2 in list(unique)[i + 1:]
+             if l1 in subspaces and l2 in subspaces]
+    if not pairs:
+        return 0.0
+
+    scores = []
+    for l1, l2 in pairs:
+        V1, V2 = subspaces[l1], subspaces[l2]
+        k_min   = min(len(V1), len(V2))
+        inner   = np.abs(V1[:k_min] @ V2[:k_min].T)   # (k_min, k_min) cosines
+        coherence = float(np.linalg.norm(inner, 'fro')) / k_min
+        scores.append(1.0 - min(coherence, 1.0))
+    return float(np.mean(scores))
+
+
 def linear_probe(emb: np.ndarray, gri: np.ndarray, tir: np.ndarray,
                  cv: np.ndarray, name: str) -> dict:
     """Ridge regression (5-fold CV) predicting GRI from embeddings vs raw stats."""
@@ -263,23 +358,40 @@ def linear_probe(emb: np.ndarray, gri: np.ndarray, tir: np.ndarray,
 
 
 def geometry_summary(name: str, emb: np.ndarray, gri: np.ndarray,
-                     tir: np.ndarray, cv: np.ndarray) -> dict:
+                     tir: np.ndarray, cv: np.ndarray,
+                     therapy: np.ndarray) -> dict:
     print(f'\n  === Geometry: {name} ===')
-    pca  = pca_effective_dims(emb)
-    iso  = isotropy(emb)
-    lid  = lid_mle(emb)
-    knn  = knn_consistency(emb, gri)
+    pca   = pca_effective_dims(emb)
+    iso   = isotropy(emb)
+    lid   = lid_mle(emb)
+    knn   = knn_consistency(emb, gri)
     probe = linear_probe(emb, gri, tir, cv, name)
     k_vals, sil_scores, k_best, _ = kmeans_silhouette(emb)
+
+    gri_q   = np.digitize(gri, np.percentile(gri, [25, 50, 75]))
+    mcr_gri = mcr2_delta(emb, gri_q)
+    mcr_th  = mcr2_delta(emb, therapy)
+    bw_gri  = between_within_ratio(emb, gri_q)
+    bw_th   = between_within_ratio(emb, therapy)
+    inc_gri = subspace_incoherence(emb, gri_q)
+    inc_th  = subspace_incoherence(emb, therapy)
 
     print(f'  PCA dims (80/90/95%): {pca["n80"]} / {pca["n90"]} / {pca["n95"]}')
     print(f'  Isotropy mean cos:    {iso["mean_cos"]:.4f}  std: {iso["std_cos"]:.4f}')
     print(f'  LID (k=20):           {lid:.2f}')
     print(f'  KNN consistency:      {knn:.3f}  (k=10, GRI quartile)')
     print(f'  Best K (silhouette):  {k_best}  score={max(sil_scores):.4f}')
+    print(f'  MCR² ΔR  (GRI q):    {mcr_gri["delta_R"]:.3f}  '
+          f'(therapy: {mcr_th["delta_R"]:.3f})')
+    print(f'  B/W ratio (GRI q):   {bw_gri["ratio"]:.4f}  '
+          f'(therapy: {bw_th["ratio"]:.4f})')
+    print(f'  Subspace incoh (GRI): {inc_gri:.4f}  (therapy: {inc_th:.4f})')
 
     return dict(name=name, pca=pca, iso=iso, lid=lid, knn=knn,
-                probe=probe, k_vals=k_vals, sil_scores=sil_scores, k_best=k_best)
+                probe=probe, k_vals=k_vals, sil_scores=sil_scores, k_best=k_best,
+                mcr_gri=mcr_gri, mcr_th=mcr_th,
+                bw_gri=bw_gri, bw_th=bw_th,
+                inc_gri=inc_gri, inc_th=inc_th)
 
 
 # ── UMAP ───────────────────────────────────────────────────────────────────────
@@ -523,7 +635,7 @@ def main():
     # Geometry metrics
     results = []
     for name, emb in [('Encoder (h_cls)', enc_embs), ('Decoder (mean-pool H)', dec_embs)]:
-        r = geometry_summary(name, emb, gri, tir, cv)
+        r = geometry_summary(name, emb, gri, tir, cv, therapy)
         results.append(r)
 
     # Summary plots
@@ -538,12 +650,15 @@ def main():
     print('='*60)
     for r in results:
         print(f"\n  {r['name']}")
-        print(f"    PCA 90% var:     {r['pca']['n90']} components")
-        print(f"    Isotropy:        mean_cos={r['iso']['mean_cos']:.4f}  std={r['iso']['std_cos']:.4f}")
-        print(f"    LID (k=20):      {r['lid']:.2f}")
-        print(f"    KNN consistency: {r['knn']:.3f}")
-        print(f"    Probe R² (GRI):  emb={r['probe']['r2_emb']:.3f}  raw={r['probe']['r2_raw']:.3f}")
-        print(f"    Best K:          {r['k_best']}  silhouette={max(r['sil_scores']):.4f}")
+        print(f"    PCA 90% var:      {r['pca']['n90']} components")
+        print(f"    Isotropy:         mean_cos={r['iso']['mean_cos']:.4f}  std={r['iso']['std_cos']:.4f}")
+        print(f"    LID (k=20):       {r['lid']:.2f}")
+        print(f"    KNN consistency:  {r['knn']:.3f}")
+        print(f"    Probe R² (GRI):   emb={r['probe']['r2_emb']:.3f}  raw={r['probe']['r2_raw']:.3f}")
+        print(f"    Best K:           {r['k_best']}  silhouette={max(r['sil_scores']):.4f}")
+        print(f"    MCR² ΔR (GRI q):  {r['mcr_gri']['delta_R']:.3f}  (therapy: {r['mcr_th']['delta_R']:.3f})")
+        print(f"    B/W ratio (GRI):  {r['bw_gri']['ratio']:.4f}  (therapy: {r['bw_th']['ratio']:.4f})")
+        print(f"    Subspace incoh:   {r['inc_gri']:.4f}  (therapy: {r['inc_th']:.4f})")
 
     print(f'\n  All plots saved to {PLOT_DIR}/')
 

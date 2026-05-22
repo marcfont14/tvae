@@ -27,7 +27,7 @@ CONTIGUITY_THRESHOLD = 1.0
 
 HYPO_THRESHOLD         = 70.0   # mg/dL
 HYPO_AHEAD             = 24     # timesteps = 2 h at 5-min resolution
-HYPO_AHEAD_NOCTURNAL   = 96     # timesteps = 8 h (full night, bedtime_only mode)
+HYPO_AHEAD_NOCTURNAL   = 84     # timesteps = 7 h (full night, bedtime_only mode)
 
 # Imputation gap lengths matching MTSM training distribution (steps × 5min = duration)
 # MTSM was trained with MASK_MIN_LEN=60 (5h) and MASK_MAX_LEN=96 (8h).

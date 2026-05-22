@@ -12,12 +12,8 @@ D_FF       = 256
 DROPOUT    = 0.2
 
 WEIGHTS_PATH        = 'results/mtsm/encoder_global_norm/encoder_weights.weights.h5'
-WEIGHTS_PATH_E3     = 'results/mtsm/encoder3/encoder_weights.weights.h5'
 WEIGHTS_PATH_DECODER  = 'results/mtsm/decoder_global_norm/encoder_weights.weights.h5'
 NTP_MODEL_WEIGHTS     = 'results/mtsm/decoder_global_norm/model_weights.weights.h5'
-WEIGHTS_PATH_DECODER2 = 'results/mtsm/decoder2/encoder_weights.weights.h5'
-NTP_HEAD2_WEIGHTS     = 'results/mtsm/decoder2/ntp_head_weights.weights.h5'
-PREFIX_LEN           = 144   # steps 0-143 bidirectional, 144-287 causal+full-prefix
 
 
 class CLSToken(layers.Layer):
@@ -73,17 +69,11 @@ def load_encoder(weights_path: str = WEIGHTS_PATH, trainable: bool = False,
     return encoder
 
 
-# ── Encoder3 — Prefix-LM, no CLS ─────────────────────────────────────────────
+# ── Decoder — fully causal (GPT-style, next-token prediction) ────────────────
 
-class PrefixLMBlock(layers.Layer):
-    """
-    Transformer block with prefix-LM attention mask.
-    Positions [0, prefix_len) are fully bidirectional.
-    Positions [prefix_len, seq_len) are causal but attend to the full prefix.
-    Mask is precomputed once and stored as a constant — no per-call overhead.
-    """
-    def __init__(self, d_model, n_heads, d_ff, dropout,
-                 prefix_len, seq_len, name=None, **kwargs):
+class _CausalBlock(layers.Layer):
+    """Transformer block with fully lower-triangular (causal) attention mask."""
+    def __init__(self, d_model, n_heads, d_ff, dropout, seq_len, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.mhsa  = layers.MultiHeadAttention(
             num_heads=n_heads, key_dim=d_model // n_heads, dropout=dropout)
@@ -94,10 +84,9 @@ class PrefixLMBlock(layers.Layer):
         self.ffn2  = layers.Dense(d_model)
         self.drop3 = layers.Dropout(dropout)
         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
-        rows    = np.arange(seq_len)[:, np.newaxis]
-        cols    = np.arange(seq_len)[np.newaxis, :]
-        blocked = (rows >= prefix_len) & (cols >= prefix_len) & (cols > rows)
-        self._mask = tf.constant((~blocked)[np.newaxis], dtype=tf.bool)  # (1, T, T)
+        rows = np.arange(seq_len)[:, np.newaxis]
+        cols = np.arange(seq_len)[np.newaxis, :]
+        self._mask = tf.constant((cols <= rows)[np.newaxis], dtype=tf.bool)  # (1, T, T)
 
     def call(self, x, training=False):
         attn = self.mhsa(x, x, attention_mask=self._mask, training=training)
@@ -110,53 +99,23 @@ class PrefixLMBlock(layers.Layer):
         return self.norm2(x + ffn)
 
 
-def build_encoder3(n_features: int = N_FEATURES, d_model: int = D_MODEL,
-                   n_heads: int = N_HEADS, n_layers: int = N_LAYERS,
-                   d_ff: int = D_FF, dropout: float = DROPOUT,
-                   window_len: int = WINDOW_LEN,
-                   prefix_len: int = PREFIX_LEN) -> keras.Model:
-    """
-    Encoder3: Prefix-LM masking, no CLS token, sequence length = window_len.
-    Steps [0, prefix_len) fully bidirectional; [prefix_len, window_len) causal + full prefix.
-    Returns [H (B, T, d), h_last (B, d)] — same two-output API as encoder2.
-    h_last = H[:, -1, :]: final causal step, used as per-window summary in Stage 2.
-    """
-    inp = keras.Input(shape=(window_len, n_features), name='input')
-    x   = layers.Dense(d_model, name='input_proj')(inp)
-    x   = x + _positional_encoding(window_len, d_model)
-    for i in range(n_layers):
-        x = PrefixLMBlock(d_model, n_heads, d_ff, dropout,
-                          prefix_len, window_len, name=f'prefix_lm_{i}')(x)
-    h_last = layers.Lambda(lambda z: z[:, -1, :], name='h_last')(x)
-    return keras.Model(inp, [x, h_last], name='TransformerEncoder3')
-
-
-def load_encoder3(weights_path: str = WEIGHTS_PATH_E3, trainable: bool = False,
-                  **kwargs) -> keras.Model:
-    encoder = build_encoder3(**kwargs)
-    encoder(tf.zeros((1, WINDOW_LEN, kwargs.get('n_features', N_FEATURES))))
-    encoder.load_weights(weights_path)
-    encoder.trainable = trainable
-    return encoder
-
-
-# ── Decoder — fully causal (GPT-style, next-token prediction) ────────────────
-
 def build_decoder(n_features: int = N_FEATURES, d_model: int = D_MODEL,
                   n_heads: int = N_HEADS, n_layers: int = N_LAYERS,
                   d_ff: int = D_FF, dropout: float = DROPOUT,
                   window_len: int = WINDOW_LEN) -> keras.Model:
     """
-    Causal decoder: PrefixLMBlock(prefix_len=0) → fully lower-triangular attention mask.
-    Identical hyperparams to encoder2. No CLS token.
-    Returns [H (B, T, d), h_last (B, d)] — same two-output API as encoder3.
-    h_last = H[:, -1, :]: causally conditioned summary of the full 24h window.
+    Causal decoder: fully lower-triangular attention mask, no CLS token.
+    Identical hyperparams to the encoder.
+    Returns [H (B, T, d), h_last (B, d)] — h_last = H[:, -1, :].
     """
-    model = build_encoder3(n_features=n_features, d_model=d_model, n_heads=n_heads,
-                           n_layers=n_layers, d_ff=d_ff, dropout=dropout,
-                           window_len=window_len, prefix_len=0)
-    model._name = 'CausalDecoder'
-    return model
+    inp = keras.Input(shape=(window_len, n_features), name='input')
+    x   = layers.Dense(d_model, name='input_proj')(inp)
+    x   = x + _positional_encoding(window_len, d_model)
+    for i in range(n_layers):
+        x = _CausalBlock(d_model, n_heads, d_ff, dropout,
+                         window_len, name=f'causal_{i}')(x)
+    h_last = layers.Lambda(lambda z: z[:, -1, :], name='h_last')(x)
+    return keras.Model(inp, [x, h_last], name='CausalDecoder')
 
 
 def load_decoder(weights_path: str = WEIGHTS_PATH_DECODER, trainable: bool = False,
@@ -208,28 +167,3 @@ def load_ntp_head(model_weights_path: str = NTP_MODEL_WEIGHTS) -> keras.Model:
         name='pred_z',
     )(x)   # (B,)
     return keras.Model(h_inp, out, name='NTPHead')
-
-
-def load_decoder2(weights_path: str = WEIGHTS_PATH_DECODER2, trainable: bool = False,
-                  **kwargs) -> keras.Model:
-    decoder = build_decoder(**kwargs)
-    decoder(tf.zeros((1, WINDOW_LEN, kwargs.get('n_features', N_FEATURES))))
-    decoder.load_weights(weights_path)
-    decoder.trainable = trainable
-    return decoder
-
-
-def load_ntp_head2(head_weights_path: str = NTP_HEAD2_WEIGHTS) -> keras.Model:
-    """
-    Load decoder2 NTP delta head for AR rollout.
-    Outputs Δ = CGM[t+1] − CGM[t] (z-score delta, not absolute).
-    Returns head model: (B, 1, D_MODEL) → (B,).
-    """
-    h_inp = keras.Input(shape=(1, D_MODEL), name='h_input')
-    x     = layers.Dense(64, activation='relu', name='ntp_hidden')(h_inp)
-    x     = layers.Dense(1,  name='ntp_head')(x)
-    out   = layers.Lambda(lambda z: z[:, 0, 0], name='pred_delta')(x)
-    head  = keras.Model(h_inp, out, name='NTPHead2')
-    head(tf.zeros((1, 1, D_MODEL)))
-    head.load_weights(head_weights_path)
-    return head
