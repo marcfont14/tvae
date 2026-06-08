@@ -19,6 +19,12 @@ checkpoints/
 logs/
 results/
 
+# The following files inside ignored directories are tracked via git add -f:
+#   data/README.md
+#   results/outlier_analysis/pretrain_patients.txt
+#   results/outlier_analysis/test_patients.txt
+#   results/outlier_analysis/global_scaler_full.npy
+
 # Windows metadata
 *Zone.Identifier
 
