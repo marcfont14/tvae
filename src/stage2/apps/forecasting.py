@@ -83,7 +83,7 @@ def run(args):
     allowed      = _MODE_SETS[args.mode]
     run_variants = [(m, a) for m, a in VARIANTS if m in allowed]
 
-    histories, all_metrics, trained_models = {}, {}, {}
+    histories, all_metrics, trained_models, all_preds = {}, {}, {}, {}
 
     for mode, arch in run_variants:
         tag = f'{mode}_{arch}'
@@ -211,6 +211,7 @@ def run(args):
                          os.path.join(out_dir, f'clarke_{tag}.png'))
 
         all_metrics[tag] = metrics
+        all_preds[tag]   = (y_test, y_pred)
         del model
         gc.collect()
 
@@ -225,6 +226,16 @@ def run(args):
     print_metrics({k: v for k, v in naive_metrics.items() if 'Clarke' not in k})
     save_metrics(naive_metrics, os.path.join(out_dir, 'metrics_naive.json'))
     all_metrics['naive'] = naive_metrics
+    all_preds['naive']   = (naive_true, naive_pred)
+
+    # Save per-window predictions for bootstrap CI analysis
+    if all_preds:
+        preds_path = os.path.join(out_dir, 'predictions.npz')
+        first_y_true = next(iter(all_preds.values()))[0]
+        save_dict = {'y_true': first_y_true}
+        save_dict.update({tag: yp for tag, (_, yp) in all_preds.items()})
+        np.savez(preds_path, **save_dict)
+        print(f'  Saved predictions.npz ({list(all_preds)} variants)')
 
     if histories:
         plot_training_curves(histories, os.path.join(out_dir, 'training_curves.png'))
