@@ -171,8 +171,9 @@ python -u scripts/plot_imputation_examples_v2.py
 python -u scripts/plot_feature_importance.py
 
 # Embedding and patient-level figures
-python -u scripts/plot_embeddings.py
-python -u scripts/plot_umap_3d_final.py
+python -u scripts/plot_embeddings.py          # 2D UMAP (umap_2d.png) + 3D interactive
+python -u scripts/plot_umap_clean.py          # 2-panel 2D UMAP, GRI quintile (umap_clean.png)
+python -u scripts/plot_umap_3d_final.py       # 2×3 grid, 3 viewing angles (umap_3d_2x3.png)
 python -u scripts/plot_patient_scatter_2x3.py
 ```
 
@@ -182,9 +183,10 @@ python -u scripts/plot_patient_scatter_2x3.py
 
 | Task | Model | Metric |
 |---|---|---|
-| Gap imputation (4 h) | FM encoder (zero-shot) | R² = 0.68 vs Raw R² = 0.12 |
-| Forecasting t+5 | Decoder fine-tuned | RMSE = 7.1 mg/dL |
-| Nocturnal hypo risk | Decoder fine-tuned | AUROC = 0.737 |
+| Gap imputation (4 h) | FM encoder (zero-shot) | R² = 0.78 vs Raw R² = 0.12 |
+| Forecasting t+5 (short horizon) | Raw LSTM | RMSE = 7.94 mg/dL (best short) |
+| Forecasting t+120 (long horizon) | Decoder fine-tuned | RMSE = 45.65 mg/dL (best long) |
+| Nocturnal hypo risk | Decoder fine-tuned | AUROC = 0.737 (p = 0.004 vs Raw) |
 | ISF recovery | Decoder H (ridge) | R² = 0.499 vs CGM stats R² = −0.034 |
 | CR recovery | Encoder h_cls (ridge) | R² = 0.406 vs CGM stats R² = −0.008 |
 
@@ -194,5 +196,5 @@ python -u scripts/plot_patient_scatter_2x3.py
 
 - **Active feature set:** 7 features (CGM, PI, RA, hour_sin/cos, bolus flag, carbs flag). Therapy modality slots (cols 7–9) are zero-filled — ablation showed Δ ≤ 0.04 and representation probe = chance.
 - **Global vs per-patient normalisation:** Global PI/RA z-scoring is the main track. Per-patient norm archives are in `results/mtsm/encoder_clean` and `decoder_clean` for reference.
-- **All LSTMs must use `unroll=True`** — cuDNN 9 requires explicit sequence lengths that TF 2.15 doesn't provide; `unroll=False` crashes at runtime regardless of sequence length.
+- **All LSTMs must use `unroll=True`** — cuDNN 9 requires explicit sequence lengths that TF 2.17 doesn't provide; `unroll=False` crashes at runtime regardless of sequence length.
 - **GradientTape + XLA incompatibility** — always use `model.fit()`, not a custom GradientTape loop.
