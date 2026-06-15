@@ -149,6 +149,14 @@ python -u scripts/variable_justification.py    # time-stratified ablation
 
 ### Stage 5 — Bootstrap CIs and figures
 
+> **Note on paths:** the 14 `plot_*` figure scripts (the `plot_eda_*` set plus the
+> result/embedding plotters below) hardcode the repository root as
+> `/mnt/workspace/tvae` (the Docker mount point) via `os.chdir` / `sys.path.insert` /
+> `DATA_DIR` constants near the top of each file. If the repo lives anywhere else,
+> edit that path at the top of those scripts before running them. The core pipeline
+> (`main.py`, everything in `src/`) and the other `scripts/` are path-agnostic — run
+> them from the repo root.
+
 ```bash
 # Confidence intervals for all Stage 2 tables
 python -u scripts/bootstrap_ci.py \
